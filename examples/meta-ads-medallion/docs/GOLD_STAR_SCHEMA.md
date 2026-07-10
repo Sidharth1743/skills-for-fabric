@@ -138,3 +138,9 @@ erDiagram
 ## SQL view
 
 `vw_meta_ad_performance` reconstructs the same grain by joining fact → dims (for Lakehouse SQL endpoint / Warehouse consumers who prefer star navigation).
+
+## Referential integrity
+
+Facts require resolved `ad_sk` / `adset_sk` / `campaign_sk` / `account_sk` / `date_key`.
+Insight rows whose `ad_id` is missing from `dim_ad` are dropped (logged as unresolved FK count).
+Example from sample extract: ad `120247450017800156` appears in insights but not in the ads entity extract (15 daily rows excluded).
