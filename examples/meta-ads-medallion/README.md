@@ -48,12 +48,21 @@ python examples/meta-ads-medallion/scripts/silver_to_gold.py \
 
 ## Fabric execution
 
-1. Create a schema-enabled lakehouse and schemas `bronze` / `silver` / `gold`.
-2. Upload CSVs to `Files/landing/meta/`.
-3. Run `notebooks/01_bronze_ingest.ipynb`.
-4. Run `notebooks/02_silver_transform.ipynb`.
-5. Run `notebooks/03_gold_star_schema.ipynb`.
-6. Confirm validation: fact rows = reporting rows, orphan FKs = 0.
+See **[docs/DEPLOY_TO_FABRIC.md](docs/DEPLOY_TO_FABRIC.md)** for Portal + CLI deploy steps.
+
+Quick CLI:
+
+```bash
+export FABRIC_WORKSPACE_NAME="MetaAds-Dev"
+export FABRIC_LAKEHOUSE_NAME="meta_ads_lh"
+export META_CSV_DIR="/path/to/meta/csvs"
+./scripts/deploy_to_fabric.sh
+```
+
+Manual order if importing notebooks in the portal:
+1. Upload CSVs to `Files/landing/meta/`
+2. Run `01_bronze_ingest` → `02_silver_transform` → `03_gold_star_schema`
+3. Query `gold.rpt_meta_ad_performance_daily` / `gold.vw_meta_ad_performance`
 
 ## Notes
 
