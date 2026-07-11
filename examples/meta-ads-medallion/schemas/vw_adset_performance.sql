@@ -1,0 +1,17 @@
+-- Ad set / ad group × day performance (Meta + Google)
+CREATE OR REPLACE VIEW Gold.vw_adset_performance AS
+SELECT
+  platform, full_date, year, month, month_name, day_name,
+  account_id, MAX(account_name) AS account_name,
+  campaign_id, MAX(campaign_name) AS campaign_name,
+  adset_id, MAX(adset_name) AS adset_name, MAX(adset_status) AS adset_status,
+  MAX(optimization_goal) AS optimization_goal,
+  MAX(age_range) AS age_range, MAX(geo_cities) AS geo_cities, MAX(geo_regions) AS geo_regions,
+  SUM(impressions) AS impressions, SUM(reach) AS reach,
+  SUM(clicks) AS clicks, SUM(spend) AS spend, SUM(leads) AS leads,
+  CASE WHEN SUM(clicks) > 0 THEN SUM(spend) / SUM(clicks) ELSE NULL END AS cpc,
+  CASE WHEN SUM(impressions) > 0 THEN (SUM(spend) / SUM(impressions)) * 1000 ELSE NULL END AS cpm,
+  CASE WHEN SUM(leads) > 0 THEN SUM(spend) / SUM(leads) ELSE NULL END AS cost_per_lead,
+  COUNT(DISTINCT ad_id) AS ad_count
+FROM Gold.rpt_unified_ad_performance
+GROUP BY platform, full_date, year, month, month_name, day_name, account_id, campaign_id, adset_id;
