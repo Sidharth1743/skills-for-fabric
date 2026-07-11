@@ -3,8 +3,11 @@
 CREATE OR REPLACE VIEW Gold.vw_campaign_performance AS
 SELECT
   platform, full_date, year, month, month_name, day_name,
-  MAX(tenant_id) AS tenant_id, MAX(connector_id) AS connector_id,
-  account_id, MAX(account_name) AS account_name,
+  MAX(tenant_id) AS tenant_id,
+  MAX(connector_id) AS connector_id,
+  account_id,
+  CAST(NULL AS STRING) AS customer_id,
+  MAX(account_name) AS account_name,
   campaign_id, MAX(campaign_name) AS campaign_name,
   MAX(campaign_status) AS campaign_status,
   MAX(campaign_channel_or_objective) AS campaign_channel_or_objective,

@@ -4,7 +4,10 @@
 CREATE SCHEMA IF NOT EXISTS Staging_Gold;
 
 CREATE OR REPLACE VIEW Staging_Gold.vw_ad_performance AS
-SELECT * FROM Gold.rpt_unified_ad_performance;
+SELECT
+  src.*,
+  CAST(NULL AS STRING) AS customer_id
+FROM Gold.rpt_unified_ad_performance AS src;
 
 CREATE OR REPLACE VIEW Staging_Gold.vw_unified_ad_performance AS
 SELECT * FROM Gold.rpt_unified_ad_performance;
@@ -18,7 +21,11 @@ SELECT * FROM Gold.rpt_google_ad_performance_daily;
 CREATE OR REPLACE VIEW Staging_Gold.vw_adset_performance AS
 SELECT
   platform, full_date, year, month, month_name, day_name,
-  account_id, MAX(account_name) AS account_name,
+  MAX(tenant_id) AS tenant_id,
+  MAX(connector_id) AS connector_id,
+  account_id,
+  CAST(NULL AS STRING) AS customer_id,
+  MAX(account_name) AS account_name,
   campaign_id, MAX(campaign_name) AS campaign_name,
   adset_id, MAX(adset_name) AS adset_name, MAX(adset_status) AS adset_status,
   MAX(optimization_goal) AS optimization_goal,
@@ -35,7 +42,11 @@ GROUP BY platform, full_date, year, month, month_name, day_name, account_id, cam
 CREATE OR REPLACE VIEW Staging_Gold.vw_campaign_performance AS
 SELECT
   platform, full_date, year, month, month_name, day_name,
-  account_id, MAX(account_name) AS account_name,
+  MAX(tenant_id) AS tenant_id,
+  MAX(connector_id) AS connector_id,
+  account_id,
+  CAST(NULL AS STRING) AS customer_id,
+  MAX(account_name) AS account_name,
   campaign_id, MAX(campaign_name) AS campaign_name,
   MAX(campaign_status) AS campaign_status,
   MAX(campaign_channel_or_objective) AS campaign_channel_or_objective,
