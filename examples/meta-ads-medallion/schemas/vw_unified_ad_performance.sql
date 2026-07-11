@@ -1,8 +1,6 @@
--- Google Ads reporting view (alias of reporting table)
--- CREATE OR REPLACE VIEW Gold.vw_google_ad_performance AS
--- SELECT * FROM Gold.rpt_google_ad_performance_daily;
+-- Unified Meta + Google Ads performance (natural keys only — no *_sk)
+-- Prefer the materialized table Gold.rpt_unified_ad_performance when available.
 
--- Unified Meta + Google Ads performance
 CREATE OR REPLACE VIEW Gold.vw_unified_ad_performance AS
 SELECT
   CAST('meta' AS STRING) AS platform,

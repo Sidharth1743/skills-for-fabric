@@ -53,3 +53,25 @@ SELECT TOP 100 *
 FROM Gold.vw_unified_ad_performance
 WHERE platform = 'google_ads';
 ```
+
+## Unified rebuild (Meta + Google)
+
+Notebook: `notebooks/06_rebuild_unified_both_platforms.ipynb`
+
+- Rebuilds `Gold.rpt_meta_ad_performance_daily` from `Files/Silver/meta_ads`
+- Refreshes `Gold.rpt_google_ad_performance_daily` from `Files/Development/Silver/GoogleAds`
+- Materializes `Gold.rpt_unified_ad_performance` + `Gold.vw_unified_ad_performance`
+- Reporting keys are business IDs only: `account_id`, `campaign_id`, `adset_or_adgroup_id`, `ad_id` (no `account_sk` / `*_sk`)
+
+Verify:
+
+```sql
+SELECT platform, COUNT(*) AS rows, SUM(spend_inr) AS spend
+FROM Gold.vw_unified_ad_performance
+GROUP BY platform;
+
+SELECT platform, account_id, account_name, COUNT(*) AS rows
+FROM Gold.vw_unified_ad_performance
+GROUP BY platform, account_id, account_name;
+```
+
