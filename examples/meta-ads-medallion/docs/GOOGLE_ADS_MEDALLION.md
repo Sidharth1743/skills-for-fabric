@@ -75,3 +75,14 @@ FROM Gold.vw_unified_ad_performance
 GROUP BY platform, account_id, account_name;
 ```
 
+
+## Priority insights + age/geo enrichment
+
+Notebook: `notebooks/07_enrich_priority_age_geo.ipynb`
+
+Bronze verification:
+- Meta insights `actions[]` → leads, link_clicks, landing_page_views, post_engagement, video_views_3s
+- Meta adset `targeting` → age_min/max/age_range, geo_country/regions/cities (configured targeting, not delivery breakdown)
+- Google bronze has no age/geo (null in unified)
+
+Gold grain remains: account → campaign → adset → ad → date → metrics
