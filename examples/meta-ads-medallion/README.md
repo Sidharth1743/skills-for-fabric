@@ -23,7 +23,7 @@
 
 See [docs/SILVER_SCHEMA.md](docs/SILVER_SCHEMA.md) and [docs/GOLD_STAR_SCHEMA.md](docs/GOLD_STAR_SCHEMA.md).
 
-### Gold star schema
+### Gold star schema (Meta)
 
 | Object | Role |
 |--------|------|
@@ -33,6 +33,17 @@ See [docs/SILVER_SCHEMA.md](docs/SILVER_SCHEMA.md) and [docs/GOLD_STAR_SCHEMA.md
 | `vw_meta_ad_performance` | SQL view over the star |
 
 SQL view DDL: [schemas/vw_meta_ad_performance.sql](schemas/vw_meta_ad_performance.sql)
+
+### Google Ads (Development)
+
+See [docs/GOOGLE_ADS_MEDALLION.md](docs/GOOGLE_ADS_MEDALLION.md).
+
+| Notebook | Writes to |
+|----------|-----------|
+| `04_google_ads_silver.ipynb` | `Files/Development/Silver/GoogleAds/` |
+| `05_google_ads_gold.ipynb` | `Files/Development/Gold/GoogleAds/` + `Gold.*` |
+
+Unified view (Meta ∪ Google): [schemas/vw_unified_ad_performance.sql](schemas/vw_unified_ad_performance.sql) → `Gold.vw_unified_ad_performance`
 
 ## Local validation (no Fabric required)
 
