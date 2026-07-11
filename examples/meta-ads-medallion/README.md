@@ -80,3 +80,7 @@ Manual order if importing notebooks in the portal:
 - Do **not** commit production Meta extracts into git (`data/` and `output/` are gitignored).
 - Meta budget fields: paise ÷ 100 → INR (`*_amount` in Silver, `*_inr` in Gold).
 - Insight `actions[]` are exploded in Silver and pivoted into fact measures (`leads`, `link_clicks`, etc.) in Gold.
+
+## Incremental refresh
+
+See [docs/INCREMENTAL_REFRESH.md](docs/INCREMENTAL_REFRESH.md). Default `FULL_REFRESH=False` merges only new/recent dates into Silver/Gold.
