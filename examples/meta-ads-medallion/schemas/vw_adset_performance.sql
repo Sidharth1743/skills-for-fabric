@@ -1,5 +1,7 @@
--- Ad set / ad group × day performance (Meta + Google)
-CREATE OR REPLACE VIEW Gold.vw_adset_performance AS
+-- Gold adset × day performance — Delta table (SQL Analytics Endpoint–safe)
+-- Materialized from Gold.rpt_unified_ad_performance (not a Spark view).
+
+CREATE OR REPLACE TABLE Gold.vw_adset_performance AS
 SELECT
   platform, full_date, year, month, month_name, day_name,
   MAX(tenant_id) AS tenant_id,

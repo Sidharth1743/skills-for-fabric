@@ -1,6 +1,8 @@
--- Campaign × day performance (Meta + Google)
--- Rolled up from Gold.rpt_unified_ad_performance (ad × day source of truth)
-CREATE OR REPLACE VIEW Gold.vw_campaign_performance AS
+-- Gold campaign × day performance — Delta table (SQL Analytics Endpoint–safe)
+-- Materialized from Gold.rpt_unified_ad_performance (not a Spark view).
+-- Recreate with: DROP TABLE IF EXISTS ... ; CTAS / saveAsTable overwrite.
+
+CREATE OR REPLACE TABLE Gold.vw_campaign_performance AS
 SELECT
   platform, full_date, year, month, month_name, day_name,
   MAX(tenant_id) AS tenant_id,

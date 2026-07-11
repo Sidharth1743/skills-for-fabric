@@ -1,24 +1,22 @@
--- Mirror Gold performance views into Staging_Gold (keep both schemas)
--- Source of truth: Gold.rpt_* tables
+-- Staging_Gold performance objects — Delta tables (SQL Analytics Endpoint–safe)
+-- Source of truth: Gold.rpt_* tables. Same names as Gold for backend consumers.
 
 CREATE SCHEMA IF NOT EXISTS Staging_Gold;
 
-CREATE OR REPLACE VIEW Staging_Gold.vw_ad_performance AS
-SELECT
-  src.*,
-  CAST(NULL AS STRING) AS customer_id
+CREATE OR REPLACE TABLE Staging_Gold.vw_ad_performance AS
+SELECT src.*, CAST(NULL AS STRING) AS customer_id
 FROM Gold.rpt_unified_ad_performance AS src;
 
-CREATE OR REPLACE VIEW Staging_Gold.vw_unified_ad_performance AS
+CREATE OR REPLACE TABLE Staging_Gold.vw_unified_ad_performance AS
 SELECT * FROM Gold.rpt_unified_ad_performance;
 
-CREATE OR REPLACE VIEW Staging_Gold.vw_meta_ad_performance AS
+CREATE OR REPLACE TABLE Staging_Gold.vw_meta_ad_performance AS
 SELECT * FROM Gold.rpt_meta_ad_performance_daily;
 
-CREATE OR REPLACE VIEW Staging_Gold.vw_google_ad_performance AS
+CREATE OR REPLACE TABLE Staging_Gold.vw_google_ad_performance AS
 SELECT * FROM Gold.rpt_google_ad_performance_daily;
 
-CREATE OR REPLACE VIEW Staging_Gold.vw_adset_performance AS
+CREATE OR REPLACE TABLE Staging_Gold.vw_adset_performance AS
 SELECT
   platform, full_date, year, month, month_name, day_name,
   MAX(tenant_id) AS tenant_id,
@@ -39,7 +37,7 @@ SELECT
 FROM Gold.rpt_unified_ad_performance
 GROUP BY platform, full_date, year, month, month_name, day_name, account_id, campaign_id, adset_id;
 
-CREATE OR REPLACE VIEW Staging_Gold.vw_campaign_performance AS
+CREATE OR REPLACE TABLE Staging_Gold.vw_campaign_performance AS
 SELECT
   platform, full_date, year, month, month_name, day_name,
   MAX(tenant_id) AS tenant_id,
