@@ -57,6 +57,14 @@ python examples/meta-ads-medallion/scripts/silver_to_gold.py \
   --output-dir examples/meta-ads-medallion/output/gold
 ```
 
+## Scheduled Silver/Gold refresh (Fabric)
+
+Production workspace uses **`MIP_Medallion_Refresh_Pipeline`** on a **5-minute Cron** schedule.
+
+- After Bronze lands new `*_latest_batch.txt` / `{batchId}.csv` files, the pipeline rebuilds Silver + Gold + `vw_*` Delta tables.
+- Unchanged bronze batchIds → NOOP (skips Spark work).
+- Details: **[docs/MEDALLION_REFRESH_PIPELINE.md](docs/MEDALLION_REFRESH_PIPELINE.md)**
+
 ## Fabric execution
 
 See **[docs/DEPLOY_TO_FABRIC.md](docs/DEPLOY_TO_FABRIC.md)** for Portal + CLI deploy steps.

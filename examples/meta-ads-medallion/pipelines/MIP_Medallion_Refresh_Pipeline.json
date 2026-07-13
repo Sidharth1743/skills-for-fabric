@@ -1,0 +1,22 @@
+{
+  "properties": {
+    "activities": [
+      {
+        "name": "MedallionRefresh",
+        "type": "TridentNotebook",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "0.12:00:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "notebookId": "3d829efc-d670-489f-98ad-65770ec13b74",
+          "workspaceId": "718e8176-5d40-4a9c-88ff-50ac97ac49ba"
+        }
+      }
+    ]
+  }
+}
