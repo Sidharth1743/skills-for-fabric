@@ -2,7 +2,7 @@
   "properties": {
     "activities": [
       {
-        "name": "MedallionRefresh",
+        "name": "MedallionIncrementalRefresh",
         "type": "TridentNotebook",
         "dependsOn": [],
         "policy": {

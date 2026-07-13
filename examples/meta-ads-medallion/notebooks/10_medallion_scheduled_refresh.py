@@ -12,385 +12,437 @@
 # META   }
 # META }
 
-# MARKDOWN ********************
-
-# # MIP Medallion Scheduled Refresh
-# Runs every N minutes via Fabric pipeline schedule.
-# - Skips when no new Bronze batchIds (unless FORCE_RUN / FULL_REFRESH)
-# - Prefers `*{batchId}.csv` over `*_latest.csv`
-# - Rebuilds Meta + Google Silver/Gold + unified + vw_* Delta tables
-
-
-# PARAMETERS CELL ********************
-
-FULL_REFRESH = False
-FORCE_RUN = False
-INCREMENTAL_LOOKBACK_DAYS = 2
-INCREMENTAL_MAX_DAYS = 14
-SCHEMA = 'Gold'
-CONTROL_PATH = 'Files/Silver/_control/medallion_pipeline_watermark.json'
-SUMMARY_PATH = 'Files/Development/Gold/exports/pipeline_refresh_summary.txt'
-
-
 # CELL ********************
 
 from pyspark.sql import functions as F
-from pyspark.sql import types as T
 from pyspark.sql.window import Window
-from datetime import datetime, timezone, timedelta
-import json, re, uuid
+from delta.tables import DeltaTable
+from notebookutils import mssparkutils
+from datetime import datetime, timezone
+import json, re
 
-META_BRONZE = 'Files/Development/Bronze/Meta_ads'
-GOOGLE_BRONZE = 'Files/Development/Bronze/Google_ads'
-META_SILVER = 'Files/Development/Silver/meta_ads'
-GOOGLE_SILVER = 'Files/Development/Silver/GoogleAds'
+SCHEMA = "Gold"
+META_ROOT = "Files/Development/Bronze/Meta_ads"
+GOOGLE_ROOT = "Files/Development/Bronze/Google_ads"
+CONTROL = "Files/Silver/_control/medallion_pipeline_watermark.json"
+SUMMARY = "Files/Development/Gold/exports/pipeline_refresh_summary.txt"
 
-spark.sql(f'CREATE SCHEMA IF NOT EXISTS {SCHEMA}')
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
 
-def _norm(col):
-    return F.lower(F.trim(F.coalesce(F.col(col).cast('string'), F.lit(''))))
+def rel(p):
+    return ("Files/" + p.split("/Files/", 1)[1]) if "/Files/" in p else p
 
-def _to_double(c):
-    return F.regexp_replace(F.col(c).cast('string'), r'[^0-9.\-]', '').cast('double')
-
-def _to_long(c):
-    return F.regexp_replace(F.col(c).cast('string'), r'[^0-9\-]', '').cast('long')
-
-def _to_date(c):
-    s = F.trim(F.col(c).cast('string'))
-    return F.coalesce(F.to_date(s), F.to_date(s, 'M/d/yyyy'), F.to_date(s, 'yyyy/MM/dd'), F.to_date(F.to_timestamp(s)))
-
-def list_csv(folder):
+def list_batch_csvs(folder):
     try:
-        return [x.path for x in mssparkutils.fs.ls(folder) if x.path.lower().endswith('.csv')]
-    except Exception:
+        items = mssparkutils.fs.ls(folder)
+    except Exception as e:
+        print("[MISS]", folder, e)
         return []
-
-def prefer_batch(paths, prefix):
-    batch, latest = [], []
-    for p in paths:
-        name = p.rsplit('/',1)[-1]
-        if not name.startswith(prefix):
-            continue
-        if name.endswith('_latest.csv'):
-            latest.append(p)
-        elif re.match(rf'^{re.escape(prefix)}[0-9a-fA-F-]{{8,}}\.csv$', name):
-            batch.append(p)
+    batch = [rel(i.path) for i in items if (not i.isDir) and i.name.endswith(".csv") and not i.name.endswith("_latest.csv")]
+    latest = [rel(i.path) for i in items if (not i.isDir) and i.name.endswith("_latest.csv")]
     return batch if batch else latest
 
 def read_csvs(paths):
     if not paths:
         return None
-    dfs = [spark.read.option('header', True).option('inferSchema', False).option('multiLine', True).csv(p) for p in paths]
-    df = dfs[0]
-    for d in dfs[1:]:
-        df = df.unionByName(d, allowMissingColumns=True)
-    return df
+    return (
+        spark.read.option("header", True).option("inferSchema", False)
+        .option("multiLine", True).option("quote", '"').option("escape", '"')
+        .csv(paths)
+    )
 
-def read_batch_ptr(folder, name):
-    path = f'{folder}/{name}'
-    try:
-        return mssparkutils.fs.head(path, 256).strip()
-    except Exception:
-        return None
+def collect_batch_ptrs(root, entity):
+    """Read nested tenant/account/connector/*_latest_batch.txt values."""
+    base = f"{root}/{entity}"
+    found = []
+    def walk(path, depth=0):
+        if depth > 6:
+            return
+        try:
+            items = mssparkutils.fs.ls(path)
+        except Exception:
+            return
+        for it in items:
+            rp = rel(it.path)
+            if it.isDir:
+                walk(rp, depth + 1)
+            elif it.name.endswith("_latest_batch.txt"):
+                try:
+                    found.append(mssparkutils.fs.head(rp, 200).strip())
+                except Exception:
+                    pass
+    walk(base)
+    return sorted(set([x for x in found if x]))
 
-def read_watermark():
-    try:
-        return json.loads(mssparkutils.fs.head(CONTROL_PATH, 10000))
-    except Exception:
-        return {}
+def merge_into_table(df, table_name, keys):
+    """MERGE upsert — never deletes existing unmatched rows."""
+    full = f"{SCHEMA}.{table_name}"
+    if df is None or df.rdd.isEmpty():
+        print("[SKIP empty]", full)
+        return {"table": full, "skipped": True}
+    # align to existing columns when table exists
+    if spark.catalog.tableExists(full):
+        target = spark.table(full)
+        tcols = target.columns
+        for c in tcols:
+            if c not in df.columns:
+                df = df.withColumn(c, F.lit(None))
+        df = df.select(*tcols)
+        df = df.dropDuplicates(keys)
+        loc = spark.sql(f"DESCRIBE DETAIL {full}").collect()[0]["location"]
+        cond = " AND ".join([f"t.`{k}` <=> s.`{k}`" for k in keys])
+        (
+            DeltaTable.forPath(spark, loc).alias("t")
+            .merge(df.alias("s"), cond)
+            .whenMatchedUpdateAll()
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+        cnt = spark.table(full).count()
+        print("[MERGE]", full, "rows=", cnt)
+        return {"table": full, "count": cnt, "merged": True}
+    else:
+        df.write.format("delta").mode("overwrite").option("overwriteSchema", True).saveAsTable(full)
+        cnt = spark.table(full).count()
+        print("[CREATE]", full, "rows=", cnt)
+        return {"table": full, "count": cnt, "created": True}
 
-def write_json(path, obj):
-    mssparkutils.fs.put(path, json.dumps(obj, indent=2), True)
-
-current = {
-  'meta_campaigns': read_batch_ptr(META_BRONZE, 'meta_campaigns_latest_batch.txt'),
-  'meta_adsets': read_batch_ptr(META_BRONZE, 'meta_adsets_latest_batch.txt'),
-  'meta_ads': read_batch_ptr(META_BRONZE, 'meta_ads_latest_batch.txt'),
-  'meta_insights': read_batch_ptr(META_BRONZE, 'meta_insights_latest_batch.txt'),
-  'google_campaign': read_batch_ptr(GOOGLE_BRONZE, 'google_campaign_latest_batch.txt'),
-  'google_adgroup': read_batch_ptr(GOOGLE_BRONZE, 'google_adgroup_latest_batch.txt'),
-  'google_ad': read_batch_ptr(GOOGLE_BRONZE, 'google_ad_latest_batch.txt'),
-  'google_ad_performance': read_batch_ptr(GOOGLE_BRONZE, 'google_ad_performance_latest_batch.txt'),
+# -------- discover --------
+meta_ptrs = {
+    "meta_campaigns": collect_batch_ptrs(META_ROOT, "meta_campaigns"),
+    "meta_adsets": collect_batch_ptrs(META_ROOT, "meta_adsets"),
+    "meta_ads": collect_batch_ptrs(META_ROOT, "meta_ads"),
+    "meta_ad_insights": collect_batch_ptrs(META_ROOT, "meta_ad_insights"),
 }
-wm = read_watermark()
-prev = wm.get('batches', {})
-changed = {k:v for k,v in current.items() if v and prev.get(k) != v}
-print('current batches:', json.dumps(current, indent=2))
-print('changed:', list(changed.keys()) or '(none)')
+google_ptrs = {
+    "google_campaigns": collect_batch_ptrs(GOOGLE_ROOT, "google_campaigns"),
+    "google_ad_groups": collect_batch_ptrs(GOOGLE_ROOT, "google_ad_groups"),
+    "google_ads": collect_batch_ptrs(GOOGLE_ROOT, "google_ads"),
+    "google_ad_performance": collect_batch_ptrs(GOOGLE_ROOT, "google_ad_performance"),
+}
+print("META batch ptrs", {k: v for k, v in meta_ptrs.items()})
+print("GOOGLE batch ptrs", {k: v for k, v in google_ptrs.items()})
 
-should_run = bool(FORCE_RUN or FULL_REFRESH or changed)
-if not should_run:
-    msg = f'NOOP {datetime.now(timezone.utc).isoformat()} — no new bronze batchIds'
-    print(msg)
-    mssparkutils.fs.put(SUMMARY_PATH, msg + '\n', True)
-    mssparkutils.notebook.exit(json.dumps({'status':'skipped','reason':'no_new_bronze'}))
-print('Proceeding with medallion refresh...')
+# -------- META dimensions + insights --------
+camp = read_csvs(list_batch_csvs(f"{META_ROOT}/meta_campaigns"))
+adset = read_csvs(list_batch_csvs(f"{META_ROOT}/meta_adsets"))
+ads = read_csvs(list_batch_csvs(f"{META_ROOT}/meta_ads"))
+ins = read_csvs(list_batch_csvs(f"{META_ROOT}/meta_ad_insights"))
 
+def parse_meta_dim(df, entity, id_field, extra_schema):
+    if df is None:
+        return None
+    j = F.from_json(F.col("raw_json"), extra_schema)
+    return (
+        df.filter(F.col("entity_type") == entity)
+        .withColumn("j", j)
+        .select(
+            F.col("tenant_id"), F.col("connector_id"), F.col("account_id"), F.col("account_name"),
+            F.col("batch_id"), F.col("ingestion_time").cast("timestamp").alias("ingestion_time"),
+            F.col("j.id").alias(id_field),
+            F.col("j.name").alias(id_field.replace("_id", "_name") if id_field.endswith("_id") else "name"),
+            F.col("j.status").alias("status"),
+            F.col("j.*"),
+        )
+    )
 
-# CELL ********************
+# Insights are the grain for gold facts
+if ins is None:
+    raise Exception("No meta_ad_insights CSV found under Development Bronze")
 
-# -------- META SILVER + GOLD --------
-meta_files = list_csv(META_BRONZE)
-camp_p = prefer_batch(meta_files, 'meta_campaigns_')
-adset_p = prefer_batch(meta_files, 'meta_adsets_')
-ads_p = prefer_batch(meta_files, 'meta_ads_')
-ins_p = prefer_batch(meta_files, 'meta_insights_')
-print('meta paths', len(camp_p), len(adset_p), len(ads_p), len(ins_p))
-
-camp = read_csvs(camp_p).withColumn('campaign_id', F.coalesce(F.col('campaignId'), F.col('id')).cast('string')) \
-    .withColumn('account_id', F.col('accountId').cast('string')) \
-    .withColumn('campaign_name', F.col('name').cast('string')) \
-    .withColumn('campaign_status', F.col('status').cast('string')) \
-    .withColumn('objective', F.col('objective').cast('string')) \
-    .withColumn('buying_type', F.col('buyingType').cast('string')) \
-    .withColumn('daily_budget', _to_double('dailyBudget')) \
-    .withColumn('lifetime_budget', _to_double('lifetimeBudget')) \
-    .withColumn('start_time', F.to_timestamp('startTime')) \
-    .withColumn('stop_time', F.to_timestamp('stopTime')) \
-    .withColumn('created_time', F.to_timestamp('createdTime')) \
-    .withColumn('updated_time', F.to_timestamp('updatedTime')) \
-    .withColumn('ingestion_ts', F.current_timestamp()) \
-    .withColumn('source_system', F.lit('meta_ads')) \
-    .withColumn('_rk', F.row_number().over(Window.partitionBy('campaign_id').orderBy(F.col('updated_time').desc_nulls_last(), F.col('ingestion_ts').desc())))
-camp = camp.filter(F.col('_rk')==1).drop('_rk').select('campaign_id','account_id','campaign_name','campaign_status','objective','buying_type','daily_budget','lifetime_budget','start_time','stop_time','created_time','updated_time','ingestion_ts','source_system')
-camp.write.format('delta').mode('overwrite').option('overwriteSchema','true').save(f'{META_SILVER}/campaigns')
-
-adset = read_csvs(adset_p).withColumn('adset_id', F.coalesce(F.col('adsetId'), F.col('id')).cast('string')) \
-    .withColumn('campaign_id', F.col('campaignId').cast('string')) \
-    .withColumn('account_id', F.col('accountId').cast('string')) \
-    .withColumn('adset_name', F.col('name').cast('string')) \
-    .withColumn('adset_status', F.col('status').cast('string')) \
-    .withColumn('daily_budget', _to_double('dailyBudget')) \
-    .withColumn('lifetime_budget', _to_double('lifetimeBudget')) \
-    .withColumn('bid_strategy', F.col('bidStrategy').cast('string')) \
-    .withColumn('optimization_goal', F.col('optimizationGoal').cast('string')) \
-    .withColumn('billing_event', F.col('billingEvent').cast('string')) \
-    .withColumn('start_time', F.to_timestamp('startTime')) \
-    .withColumn('end_time', F.to_timestamp('endTime')) \
-    .withColumn('created_time', F.to_timestamp('createdTime')) \
-    .withColumn('updated_time', F.to_timestamp('updatedTime')) \
-    .withColumn('ingestion_ts', F.current_timestamp()) \
-    .withColumn('source_system', F.lit('meta_ads')) \
-    .withColumn('_rk', F.row_number().over(Window.partitionBy('adset_id').orderBy(F.col('updated_time').desc_nulls_last(), F.col('ingestion_ts').desc())))
-adset = adset.filter(F.col('_rk')==1).drop('_rk').select('adset_id','campaign_id','account_id','adset_name','adset_status','daily_budget','lifetime_budget','bid_strategy','optimization_goal','billing_event','start_time','end_time','created_time','updated_time','ingestion_ts','source_system')
-adset.write.format('delta').mode('overwrite').option('overwriteSchema','true').save(f'{META_SILVER}/adsets')
-
-ads = read_csvs(ads_p).withColumn('ad_id', F.coalesce(F.col('adId'), F.col('id')).cast('string')) \
-    .withColumn('adset_id', F.col('adsetId').cast('string')) \
-    .withColumn('campaign_id', F.col('campaignId').cast('string')) \
-    .withColumn('account_id', F.col('accountId').cast('string')) \
-    .withColumn('ad_name', F.col('name').cast('string')) \
-    .withColumn('ad_status', F.col('status').cast('string')) \
-    .withColumn('creative_id', F.col('creativeId').cast('string')) \
-    .withColumn('created_time', F.to_timestamp('createdTime')) \
-    .withColumn('updated_time', F.to_timestamp('updatedTime')) \
-    .withColumn('ingestion_ts', F.current_timestamp()) \
-    .withColumn('source_system', F.lit('meta_ads')) \
-    .withColumn('_rk', F.row_number().over(Window.partitionBy('ad_id').orderBy(F.col('updated_time').desc_nulls_last(), F.col('ingestion_ts').desc())))
-ads = ads.filter(F.col('_rk')==1).drop('_rk').select('ad_id','adset_id','campaign_id','account_id','ad_name','ad_status','creative_id','created_time','updated_time','ingestion_ts','source_system')
-ads.write.format('delta').mode('overwrite').option('overwriteSchema','true').save(f'{META_SILVER}/ads')
-
-ins = read_csvs(ins_p)
-ins = ins.withColumn('account_id', F.col('accountId').cast('string')) \
-    .withColumn('campaign_id', F.col('campaignId').cast('string')) \
-    .withColumn('adset_id', F.col('adsetId').cast('string')) \
-    .withColumn('ad_id', F.col('adId').cast('string')) \
-    .withColumn('date', _to_date('dateStart')) \
-    .withColumn('impressions', _to_long('impressions')) \
-    .withColumn('clicks', _to_long('clicks')) \
-    .withColumn('spend', _to_double('spend')) \
-    .withColumn('reach', _to_long('reach')) \
-    .withColumn('frequency', _to_double('frequency')) \
-    .withColumn('cpc', _to_double('cpc')) \
-    .withColumn('cpm', _to_double('cpm')) \
-    .withColumn('ctr', _to_double('ctr')) \
-    .withColumn('unique_clicks', _to_long('uniqueClicks')) \
-    .withColumn('inline_link_clicks', _to_long('inlineLinkClicks')) \
-    .withColumn('ingestion_ts', F.current_timestamp()) \
-    .withColumn('source_system', F.lit('meta_ads')) \
-    .withColumn('_rk', F.row_number().over(Window.partitionBy('account_id','campaign_id','adset_id','ad_id','date').orderBy(F.col('ingestion_ts').desc())))
-ins = ins.filter(F.col('_rk')==1).drop('_rk').filter(F.col('date').isNotNull()).select('account_id','campaign_id','adset_id','ad_id','date','impressions','clicks','spend','reach','frequency','cpc','cpm','ctr','unique_clicks','inline_link_clicks','ingestion_ts','source_system')
-ins.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy('date').save(f'{META_SILVER}/ad_insights_daily')
-print('meta silver', camp.count(), adset.count(), ads.count(), ins.count())
-
-meta_gold = ins.alias('i') \
-  .join(camp.alias('c'), 'campaign_id', 'left') \
-  .join(adset.alias('s'), 'adset_id', 'left') \
-  .join(ads.alias('a'), 'ad_id', 'left') \
-  .select(
-    F.coalesce(F.col('i.account_id'), F.col('c.account_id'), F.col('s.account_id'), F.col('a.account_id')).alias('account_id'),
-    F.col('i.campaign_id'), F.col('c.campaign_name'), F.col('c.campaign_status'), F.col('c.objective'),
-    F.col('i.adset_id'), F.col('s.adset_name'), F.col('s.adset_status'),
-    F.col('i.ad_id'), F.col('a.ad_name'), F.col('a.ad_status'), F.col('a.creative_id'),
-    F.col('i.date'), F.col('i.impressions'), F.col('i.clicks'), F.col('i.spend'), F.col('i.reach'), F.col('i.frequency'),
-    F.col('i.cpc'), F.col('i.cpm'), F.col('i.ctr'), F.col('i.unique_clicks'), F.col('i.inline_link_clicks'),
-    F.current_timestamp().alias('gold_refresh_ts'), F.lit('meta_ads').alias('source_system')
-  )
-meta_gold.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy('date').saveAsTable(f'{SCHEMA}.rpt_meta_ad_performance_daily')
-print('meta gold', meta_gold.count())
-
-
-# CELL ********************
-
-# -------- GOOGLE SILVER + GOLD --------
-g_files = list_csv(GOOGLE_BRONZE)
-gc_p = prefer_batch(g_files, 'google_campaign_')
-ga_p = prefer_batch(g_files, 'google_adgroup_')
-gad_p = prefer_batch(g_files, 'google_ad_')
-# exclude performance from ad entity prefer by filtering exact prefixes carefully
-gad_p = [p for p in gad_p if 'google_ad_performance_' not in p.rsplit('/',1)[-1] and not p.rsplit('/',1)[-1].startswith('google_adgroup_')]
-gp_p = prefer_batch(g_files, 'google_ad_performance_')
-print('google paths', len(gc_p), len(ga_p), len(gad_p), len(gp_p))
-
-gc = read_csvs(gc_p).withColumn('campaign_id', F.coalesce(F.col('campaignId'), F.col('id')).cast('string')) \
-    .withColumn('account_id', F.coalesce(F.col('customerId'), F.col('accountId')).cast('string')) \
-    .withColumn('campaign_name', F.col('name').cast('string')) \
-    .withColumn('campaign_status', F.col('status').cast('string')) \
-    .withColumn('channel_type', F.col('advertisingChannelType').cast('string')) \
-    .withColumn('bidding_strategy_type', F.col('biddingStrategyType').cast('string')) \
-    .withColumn('ingestion_ts', F.current_timestamp()) \
-    .withColumn('source_system', F.lit('google_ads')) \
-    .withColumn('_rk', F.row_number().over(Window.partitionBy('campaign_id').orderBy(F.col('ingestion_ts').desc())))
-gc = gc.filter(F.col('_rk')==1).drop('_rk')
-gc_out = gc.select('campaign_id','account_id','campaign_name','campaign_status','channel_type','bidding_strategy_type','ingestion_ts','source_system')
-gc_out.write.format('delta').mode('overwrite').option('overwriteSchema','true').save(f'{GOOGLE_SILVER}/campaigns')
-
-ga = read_csvs(ga_p).withColumn('adset_id', F.coalesce(F.col('adGroupId'), F.col('id')).cast('string')) \
-    .withColumn('campaign_id', F.col('campaignId').cast('string')) \
-    .withColumn('account_id', F.coalesce(F.col('customerId'), F.col('accountId')).cast('string')) \
-    .withColumn('adset_name', F.col('name').cast('string')) \
-    .withColumn('adset_status', F.col('status').cast('string')) \
-    .withColumn('ingestion_ts', F.current_timestamp()) \
-    .withColumn('source_system', F.lit('google_ads')) \
-    .withColumn('_rk', F.row_number().over(Window.partitionBy('adset_id').orderBy(F.col('ingestion_ts').desc())))
-ga = ga.filter(F.col('_rk')==1).drop('_rk').select('adset_id','campaign_id','account_id','adset_name','adset_status','ingestion_ts','source_system')
-ga.write.format('delta').mode('overwrite').option('overwriteSchema','true').save(f'{GOOGLE_SILVER}/adgroups')
-
-gad = read_csvs(gad_p).withColumn('ad_id', F.coalesce(F.col('adId'), F.col('id')).cast('string')) \
-    .withColumn('adset_id', F.col('adGroupId').cast('string')) \
-    .withColumn('campaign_id', F.col('campaignId').cast('string')) \
-    .withColumn('account_id', F.coalesce(F.col('customerId'), F.col('accountId')).cast('string')) \
-    .withColumn('ad_name', F.coalesce(F.col('name'), F.col('adName')).cast('string')) \
-    .withColumn('ad_status', F.col('status').cast('string')) \
-    .withColumn('ingestion_ts', F.current_timestamp()) \
-    .withColumn('source_system', F.lit('google_ads')) \
-    .withColumn('_rk', F.row_number().over(Window.partitionBy('ad_id').orderBy(F.col('ingestion_ts').desc())))
-gad = gad.filter(F.col('_rk')==1).drop('_rk').select('ad_id','adset_id','campaign_id','account_id','ad_name','ad_status','ingestion_ts','source_system')
-gad.write.format('delta').mode('overwrite').option('overwriteSchema','true').save(f'{GOOGLE_SILVER}/ads')
-
-gp = read_csvs(gp_p)
-# flexible date/metric columns
-cols = {c.lower(): c for c in gp.columns}
-def pick(*names):
-    for n in names:
-        if n.lower() in cols: return cols[n.lower()]
-    return names[0]
-date_c = pick('date','segments.date','Date')
-imp_c = pick('impressions','metrics.impressions')
-clk_c = pick('clicks','metrics.clicks')
-cost_c = pick('costMicros','metrics.cost_micros','cost','spend')
-gp2 = gp.withColumn('account_id', F.coalesce(F.col(pick('customerId','accountId')), F.lit(None)).cast('string')) \
-    .withColumn('campaign_id', F.col(pick('campaignId')).cast('string')) \
-    .withColumn('adset_id', F.col(pick('adGroupId')).cast('string')) \
-    .withColumn('ad_id', F.col(pick('adId')).cast('string')) \
-    .withColumn('date', _to_date(date_c)) \
-    .withColumn('impressions', _to_long(imp_c)) \
-    .withColumn('clicks', _to_long(clk_c)) \
-    .withColumn('cost_micros', _to_double(cost_c)) \
-    .withColumn('spend', F.when(F.col('cost_micros') > 1000, F.col('cost_micros')/F.lit(1_000_000.0)).otherwise(F.col('cost_micros'))) \
-    .withColumn('ingestion_ts', F.current_timestamp()) \
-    .withColumn('source_system', F.lit('google_ads')) \
-    .withColumn('_rk', F.row_number().over(Window.partitionBy('account_id','campaign_id','adset_id','ad_id','date').orderBy(F.col('ingestion_ts').desc())))
-gp2 = gp2.filter(F.col('_rk')==1).drop('_rk').filter(F.col('date').isNotNull()).select('account_id','campaign_id','adset_id','ad_id','date','impressions','clicks','spend','ingestion_ts','source_system')
-gp2.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy('date').save(f'{GOOGLE_SILVER}/ad_performance_daily')
-print('google silver', gc_out.count(), ga.count(), gad.count(), gp2.count())
-
-gg = gp2.alias('i') \
-  .join(gc_out.alias('c'), 'campaign_id', 'left') \
-  .join(ga.alias('s'), 'adset_id', 'left') \
-  .join(gad.alias('a'), 'ad_id', 'left') \
-  .select(
-    F.coalesce(F.col('i.account_id'), F.col('c.account_id'), F.col('s.account_id'), F.col('a.account_id')).alias('account_id'),
-    F.col('i.campaign_id'), F.col('c.campaign_name'), F.col('c.campaign_status'), F.col('c.channel_type'),
-    F.col('i.adset_id'), F.col('s.adset_name'), F.col('s.adset_status'),
-    F.col('i.ad_id'), F.col('a.ad_name'), F.col('a.ad_status'),
-    F.col('i.date'), F.col('i.impressions'), F.col('i.clicks'), F.col('i.spend'),
-    F.current_timestamp().alias('gold_refresh_ts'), F.lit('google_ads').alias('source_system')
-  )
-gg.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy('date').saveAsTable(f'{SCHEMA}.rpt_google_ad_performance_daily')
-print('google gold', gg.count())
-
-
-# CELL ********************
-
-# -------- UNIFIED + VIEWS --------
-meta_u = spark.table(f'{SCHEMA}.rpt_meta_ad_performance_daily').select(
-  F.lit('meta').alias('platform'), 'account_id','campaign_id','campaign_name','campaign_status',
-  'adset_id','adset_name','adset_status','ad_id','ad_name','ad_status','date',
-  'impressions','clicks','spend', F.col('reach').cast('long').alias('reach'), F.col('inline_link_clicks').cast('long').alias('link_clicks'),
-  'gold_refresh_ts'
+ins_j = F.from_json(
+    F.col("raw_json"),
+    "campaign_id STRING, adset_id STRING, ad_id STRING, campaign_name STRING, adset_name STRING, ad_name STRING, "
+    "impressions STRING, reach STRING, frequency STRING, clicks STRING, unique_clicks STRING, inline_link_clicks STRING, "
+    "spend STRING, ctr STRING, cpc STRING, cpm STRING, cpp STRING, unique_ctr STRING, date_start STRING, date_stop STRING, "
+    "actions STRING"
 )
-google_u = spark.table(f'{SCHEMA}.rpt_google_ad_performance_daily').select(
-  F.lit('google').alias('platform'), 'account_id','campaign_id','campaign_name','campaign_status',
-  'adset_id','adset_name','adset_status','ad_id','ad_name','ad_status','date',
-  'impressions','clicks','spend', F.lit(None).cast('long').alias('reach'), F.lit(None).cast('long').alias('link_clicks'),
-  'gold_refresh_ts'
+meta_fact = (
+    ins.filter(F.col("entity_type") == "ad_insight")
+    .withColumn("j", ins_j)
+    .select(
+        F.lit("meta").alias("platform"),
+        F.col("tenant_id"), F.col("connector_id"), F.col("account_id"), F.col("account_name"),
+        F.col("j.campaign_id").alias("campaign_id"), F.col("j.campaign_name").alias("campaign_name"),
+        F.col("j.adset_id").alias("adset_id"), F.col("j.adset_name").alias("adset_name"),
+        F.col("j.ad_id").alias("ad_id"), F.col("j.ad_name").alias("ad_name"),
+        F.to_date("j.date_start").alias("full_date"),
+        F.col("j.impressions").cast("long").alias("impressions"),
+        F.col("j.reach").cast("long").alias("reach"),
+        F.col("j.frequency").cast("double").alias("frequency"),
+        F.col("j.clicks").cast("long").alias("clicks"),
+        F.col("j.unique_clicks").cast("long").alias("unique_clicks"),
+        F.col("j.inline_link_clicks").cast("long").alias("inline_link_clicks"),
+        F.col("j.spend").cast("double").alias("spend"),
+        F.col("j.ctr").cast("double").alias("ctr"),
+        F.col("j.cpc").cast("double").alias("cpc"),
+        F.col("j.cpm").cast("double").alias("cpm"),
+        F.col("j.cpp").cast("double").alias("cpp"),
+        F.col("j.unique_ctr").cast("double").alias("unique_ctr"),
+        F.col("j.inline_link_clicks").cast("long").alias("link_clicks"),
+        F.current_timestamp().alias("gold_processed_at"),
+        F.col("batch_id"),
+        F.col("ingestion_time").cast("timestamp").alias("ingestion_time"),
+    )
+    .filter(F.col("full_date").isNotNull() & F.col("ad_id").isNotNull())
 )
-unified = meta_u.unionByName(google_u, allowMissingColumns=True)
-unified.write.format('delta').mode('overwrite').option('overwriteSchema','true').partitionBy('date').saveAsTable(f'{SCHEMA}.rpt_unified_ad_performance')
-u = spark.table(f'{SCHEMA}.rpt_unified_ad_performance')
-print('unified', u.count())
+meta_fact = meta_fact.withColumn(
+    "_rk",
+    F.row_number().over(
+        Window.partitionBy("tenant_id", "account_id", "campaign_id", "adset_id", "ad_id", "full_date")
+        .orderBy(F.col("ingestion_time").desc_nulls_last())
+    ),
+).filter(F.col("_rk") == 1).drop("_rk")
+
+# enrich calendar fields
+meta_fact = (
+    meta_fact
+    .withColumn("year", F.year("full_date").cast("string"))
+    .withColumn("month", F.month("full_date").cast("string"))
+    .withColumn("month_name", F.date_format("full_date", "MMMM"))
+    .withColumn("day_name", F.date_format("full_date", "EEEE"))
+    .withColumn("spend_inr", F.col("spend"))
+    .withColumn("campaign_status", F.lit(None).cast("string"))
+    .withColumn("campaign_objective", F.lit(None).cast("string"))
+    .withColumn("campaign_channel_or_objective", F.lit(None).cast("string"))
+    .withColumn("daily_budget_inr", F.lit(None).cast("string"))
+    .withColumn("campaign_daily_budget_inr", F.lit(None).cast("string"))
+    .withColumn("buying_type", F.lit(None).cast("string"))
+    .withColumn("campaign_bid_strategy", F.lit(None).cast("string"))
+    .withColumn("budget_remaining", F.lit(None).cast("string"))
+    .withColumn("adset_status", F.lit(None).cast("string"))
+    .withColumn("optimization_goal", F.lit(None).cast("string"))
+    .withColumn("billing_event", F.lit(None).cast("string"))
+    .withColumn("adset_bid_strategy", F.lit(None).cast("string"))
+    .withColumn("age_min", F.lit(None).cast("string"))
+    .withColumn("age_max", F.lit(None).cast("string"))
+    .withColumn("age_range", F.lit(None).cast("string"))
+    .withColumn("geo_country", F.lit(None).cast("string"))
+    .withColumn("geo_regions", F.lit(None).cast("string"))
+    .withColumn("geo_cities", F.lit(None).cast("string"))
+    .withColumn("ad_type", F.lit(None).cast("string"))
+    .withColumn("ad_status", F.lit(None).cast("string"))
+    .withColumn("creative_id", F.lit(None).cast("string"))
+    .withColumn("ad_title", F.lit(None).cast("string"))
+    .withColumn("ad_body", F.lit(None).cast("string"))
+    .withColumn("headline", F.lit(None).cast("string"))
+    .withColumn("description", F.lit(None).cast("string"))
+    .withColumn("thumbnail_url", F.lit(None).cast("string"))
+    .withColumn("leads", F.lit(None).cast("double"))
+    .withColumn("cost_per_lead", F.lit(None).cast("double"))
+    .withColumn("landing_page_views", F.lit(None).cast("long"))
+    .withColumn("post_engagement", F.lit(None).cast("long"))
+    .withColumn("video_views_3s", F.lit(None).cast("long"))
+    .withColumn("conversions", F.lit(None).cast("double"))
+    .withColumn("conversions_value", F.lit(None).cast("double"))
+    .withColumn("cost_per_conversion", F.lit(None).cast("double"))
+    .withColumn("roas", F.lit(None).cast("double"))
+    .withColumn("engagements", F.lit(None).cast("long"))
+    .withColumn("video_views", F.lit(None).cast("long"))
+)
+print("meta_fact", meta_fact.count())
+
+# -------- GOOGLE --------
+gperf = read_csvs(list_batch_csvs(f"{GOOGLE_ROOT}/google_ad_performance"))
+gcamp = read_csvs(list_batch_csvs(f"{GOOGLE_ROOT}/google_campaigns"))
+gadg = read_csvs(list_batch_csvs(f"{GOOGLE_ROOT}/google_ad_groups"))
+gads = read_csvs(list_batch_csvs(f"{GOOGLE_ROOT}/google_ads"))
+
+if gperf is None:
+    raise Exception("No google_ad_performance CSV found")
+
+gp_j = F.from_json(
+    F.col("raw_json"),
+    "campaign_id STRING, adgroup_id STRING, ad_id STRING, date STRING, impressions STRING, clicks STRING, "
+    "ctr STRING, average_cpc STRING, cost_micros STRING, cost STRING, conversions STRING, conversions_value STRING, "
+    "cost_per_conversion STRING, roas STRING"
+)
+# dim names
+gc_j = F.from_json(F.col("raw_json"), "campaign_id STRING, campaign_name STRING, status STRING, channel_type STRING")
+ga_j = F.from_json(F.col("raw_json"), "adgroup_id STRING, adgroup_name STRING, campaign_id STRING, status STRING")
+gad_j = F.from_json(F.col("raw_json"), "ad_id STRING, ad_name STRING, adgroup_id STRING, campaign_id STRING, status STRING")
+
+gc_dim = None
+if gcamp is not None:
+    gc_dim = (
+        gcamp.withColumn("j", gc_j)
+        .select(F.col("j.campaign_id").alias("campaign_id"), F.col("j.campaign_name").alias("campaign_name"),
+                F.col("j.status").alias("campaign_status"), F.col("j.channel_type").alias("campaign_channel_or_objective"),
+                F.col("ingestion_time").cast("timestamp").alias("ingestion_time"))
+        .withColumn("_rk", F.row_number().over(Window.partitionBy("campaign_id").orderBy(F.col("ingestion_time").desc_nulls_last())))
+        .filter(F.col("_rk") == 1).drop("_rk", "ingestion_time")
+    )
+ga_dim = None
+if gadg is not None:
+    ga_dim = (
+        gadg.withColumn("j", ga_j)
+        .select(F.col("j.adgroup_id").alias("adset_id"), F.col("j.adgroup_name").alias("adset_name"),
+                F.col("j.status").alias("adset_status"), F.col("ingestion_time").cast("timestamp").alias("ingestion_time"))
+        .withColumn("_rk", F.row_number().over(Window.partitionBy("adset_id").orderBy(F.col("ingestion_time").desc_nulls_last())))
+        .filter(F.col("_rk") == 1).drop("_rk", "ingestion_time")
+    )
+gad_dim = None
+if gads is not None:
+    gad_dim = (
+        gads.withColumn("j", gad_j)
+        .select(F.col("j.ad_id").alias("ad_id"), F.col("j.ad_name").alias("ad_name"),
+                F.col("j.status").alias("ad_status"), F.col("ingestion_time").cast("timestamp").alias("ingestion_time"))
+        .withColumn("_rk", F.row_number().over(Window.partitionBy("ad_id").orderBy(F.col("ingestion_time").desc_nulls_last())))
+        .filter(F.col("_rk") == 1).drop("_rk", "ingestion_time")
+    )
+
+google_fact = (
+    gperf.filter(F.col("entity_type") == "ad_performance")
+    .withColumn("j", gp_j)
+    .select(
+        F.lit("google").alias("platform"),
+        F.col("tenant_id"), F.col("connector_id"), F.col("account_id"), F.col("account_name"),
+        F.col("j.campaign_id").alias("campaign_id"),
+        F.col("j.adgroup_id").alias("adset_id"),
+        F.col("j.ad_id").alias("ad_id"),
+        F.to_date("j.date").alias("full_date"),
+        F.col("j.impressions").cast("long").alias("impressions"),
+        F.col("j.clicks").cast("long").alias("clicks"),
+        F.col("j.cost").cast("double").alias("spend"),
+        F.col("j.ctr").cast("double").alias("ctr"),
+        F.col("j.average_cpc").cast("double").alias("cpc"),
+        F.col("j.conversions").cast("double").alias("conversions"),
+        F.col("j.conversions_value").cast("double").alias("conversions_value"),
+        F.col("j.cost_per_conversion").cast("double").alias("cost_per_conversion"),
+        F.col("j.roas").cast("double").alias("roas"),
+        F.current_timestamp().alias("gold_processed_at"),
+        F.col("batch_id"),
+        F.col("ingestion_time").cast("timestamp").alias("ingestion_time"),
+    )
+    .filter(F.col("full_date").isNotNull() & F.col("ad_id").isNotNull())
+)
+if gc_dim is not None:
+    google_fact = google_fact.join(gc_dim, "campaign_id", "left")
+else:
+    google_fact = google_fact.withColumn("campaign_name", F.lit(None).cast("string")).withColumn("campaign_status", F.lit(None).cast("string")).withColumn("campaign_channel_or_objective", F.lit(None).cast("string"))
+if ga_dim is not None:
+    google_fact = google_fact.join(ga_dim, "adset_id", "left")
+else:
+    google_fact = google_fact.withColumn("adset_name", F.lit(None).cast("string")).withColumn("adset_status", F.lit(None).cast("string"))
+if gad_dim is not None:
+    google_fact = google_fact.join(gad_dim, "ad_id", "left")
+else:
+    google_fact = google_fact.withColumn("ad_name", F.lit(None).cast("string")).withColumn("ad_status", F.lit(None).cast("string"))
+
+google_fact = google_fact.withColumn(
+    "_rk",
+    F.row_number().over(
+        Window.partitionBy("tenant_id", "account_id", "campaign_id", "adset_id", "ad_id", "full_date")
+        .orderBy(F.col("ingestion_time").desc_nulls_last())
+    ),
+).filter(F.col("_rk") == 1).drop("_rk")
+
+google_fact = (
+    google_fact
+    .withColumn("year", F.year("full_date").cast("string"))
+    .withColumn("month", F.month("full_date").cast("string"))
+    .withColumn("month_name", F.date_format("full_date", "MMMM"))
+    .withColumn("day_name", F.date_format("full_date", "EEEE"))
+    .withColumn("spend_inr", F.col("spend"))
+    .withColumn("reach", F.lit(None).cast("long"))
+    .withColumn("frequency", F.lit(None).cast("double"))
+    .withColumn("unique_clicks", F.lit(None).cast("long"))
+    .withColumn("inline_link_clicks", F.lit(None).cast("long"))
+    .withColumn("link_clicks", F.lit(None).cast("long"))
+    .withColumn("cpm", F.when(F.col("impressions") > 0, F.col("spend") * 1000 / F.col("impressions")).otherwise(F.lit(None)))
+    .withColumn("cpp", F.lit(None).cast("double"))
+    .withColumn("unique_ctr", F.lit(None).cast("double"))
+)
+print("google_fact", google_fact.count())
+
+keys = ["platform", "account_id", "campaign_id", "adset_id", "ad_id", "full_date"]
+# optional stronger key with tenant
+keys_tenant = ["platform", "tenant_id", "account_id", "campaign_id", "adset_id", "ad_id", "full_date"]
+
+before = {}
+for t in ["rpt_meta_ad_performance_daily", "rpt_google_ad_performance_daily", "rpt_unified_ad_performance",
+          "vw_campaign_performance", "vw_adset_performance", "vw_ad_performance"]:
+    try:
+        before[t] = spark.table(f"{SCHEMA}.{t}").count() if spark.catalog.tableExists(f"{SCHEMA}.{t}") else 0
+    except Exception:
+        before[t] = 0
+print("BEFORE", before)
+
+# MERGE platform facts
+meta_for_rpt = meta_fact.drop("batch_id", "ingestion_time")
+google_for_rpt = google_fact.drop("batch_id", "ingestion_time")
+
+# Use keys without requiring tenant match if historical rows lack tenant consistency
+r1 = merge_into_table(meta_for_rpt, "rpt_meta_ad_performance_daily", ["account_id", "campaign_id", "adset_id", "ad_id", "full_date"])
+r2 = merge_into_table(google_for_rpt, "rpt_google_ad_performance_daily", ["account_id", "campaign_id", "adset_id", "ad_id", "full_date"])
+
+# unified = union of both facts aligned to existing unified schema
+meta_u = spark.table(f"{SCHEMA}.rpt_meta_ad_performance_daily").withColumn("platform", F.coalesce(F.col("platform"), F.lit("meta")))
+google_u = spark.table(f"{SCHEMA}.rpt_google_ad_performance_daily").withColumn("platform", F.coalesce(F.col("platform"), F.lit("google")))
+# Prefer merging incoming facts into unified directly
+incoming = meta_for_rpt.withColumn("platform", F.lit("meta")).unionByName(
+    google_for_rpt.withColumn("platform", F.lit("google")), allowMissingColumns=True
+)
+r3 = merge_into_table(incoming, "rpt_unified_ad_performance", ["platform", "account_id", "campaign_id", "adset_id", "ad_id", "full_date"])
+
+# Rematerialize views from unified (full rebuild of vw only; fact data preserved via merge above)
+SRC = f"{SCHEMA}.rpt_unified_ad_performance"
+u = spark.table(SRC)
+campaign_sql = f"""
+SELECT platform, full_date, year, month, month_name, day_name,
+  MAX(tenant_id) AS tenant_id, MAX(connector_id) AS connector_id, account_id,
+  CAST(NULL AS STRING) AS customer_id, MAX(account_name) AS account_name,
+  campaign_id, MAX(campaign_name) AS campaign_name, MAX(campaign_status) AS campaign_status,
+  MAX(campaign_channel_or_objective) AS campaign_channel_or_objective, MAX(daily_budget_inr) AS daily_budget_inr,
+  SUM(impressions) AS impressions, SUM(reach) AS reach, SUM(clicks) AS clicks, SUM(spend) AS spend, SUM(leads) AS leads,
+  CASE WHEN SUM(clicks) > 0 THEN SUM(spend)/SUM(clicks) END AS cpc,
+  CASE WHEN SUM(impressions) > 0 THEN (SUM(spend)/SUM(impressions))*1000 END AS cpm,
+  CASE WHEN SUM(leads) > 0 THEN SUM(spend)/SUM(leads) END AS cost_per_lead,
+  COUNT(DISTINCT adset_id) AS adset_count, COUNT(DISTINCT ad_id) AS ad_count
+FROM {SRC}
+GROUP BY platform, full_date, year, month, month_name, day_name, account_id, campaign_id
+"""
+adset_sql = f"""
+SELECT platform, full_date, year, month, month_name, day_name,
+  MAX(tenant_id) AS tenant_id, MAX(connector_id) AS connector_id, account_id,
+  CAST(NULL AS STRING) AS customer_id, MAX(account_name) AS account_name,
+  campaign_id, MAX(campaign_name) AS campaign_name,
+  adset_id, MAX(adset_name) AS adset_name, MAX(adset_status) AS adset_status,
+  MAX(optimization_goal) AS optimization_goal, MAX(age_range) AS age_range,
+  MAX(geo_cities) AS geo_cities, MAX(geo_regions) AS geo_regions,
+  SUM(impressions) AS impressions, SUM(reach) AS reach, SUM(clicks) AS clicks, SUM(spend) AS spend, SUM(leads) AS leads,
+  CASE WHEN SUM(clicks) > 0 THEN SUM(spend)/SUM(clicks) END AS cpc,
+  CASE WHEN SUM(impressions) > 0 THEN (SUM(spend)/SUM(impressions))*1000 END AS cpm,
+  CASE WHEN SUM(leads) > 0 THEN SUM(spend)/SUM(leads) END AS cost_per_lead,
+  COUNT(DISTINCT ad_id) AS ad_count
+FROM {SRC}
+GROUP BY platform, full_date, year, month, month_name, day_name, account_id, campaign_id, adset_id
+"""
 
 def mat(name, df):
-    spark.sql(f'DROP TABLE IF EXISTS {SCHEMA}.{name}')
-    try: spark.sql(f'DROP VIEW IF EXISTS {SCHEMA}.{name}')
-    except Exception: pass
-    df.write.format('delta').mode('overwrite').option('overwriteSchema','true').saveAsTable(f'{SCHEMA}.{name}')
-    print(name, df.count())
+    spark.sql(f"DROP TABLE IF EXISTS {SCHEMA}.{name}")
+    try:
+        spark.sql(f"DROP VIEW IF EXISTS {SCHEMA}.{name}")
+    except Exception:
+        pass
+    df.write.format("delta").mode("overwrite").option("overwriteSchema", True).saveAsTable(f"{SCHEMA}.{name}")
+    print("[VW]", name, spark.table(f"{SCHEMA}.{name}").count())
 
-mat('vw_campaign_performance', u.groupBy('platform','account_id','campaign_id','campaign_name','campaign_status','date').agg(
-    F.sum('impressions').alias('impressions'), F.sum('clicks').alias('clicks'), F.sum('spend').alias('spend'),
-    F.sum('reach').alias('reach'), F.sum('link_clicks').alias('link_clicks'), F.countDistinct('ad_id').alias('ads_count'), F.countDistinct('adset_id').alias('adsets_count')
-).withColumn('ctr', F.when(F.col('impressions')>0, F.col('clicks')/F.col('impressions')).otherwise(F.lit(None))) \
- .withColumn('cpc', F.when(F.col('clicks')>0, F.col('spend')/F.col('clicks')).otherwise(F.lit(None))) \
- .withColumn('cpm', F.when(F.col('impressions')>0, F.col('spend')*1000/F.col('impressions')).otherwise(F.lit(None))) \
- .withColumn('tenant_id', F.lit(None).cast('string')).withColumn('connector_id', F.lit(None).cast('string')).withColumn('customer_id', F.lit(None).cast('string')) \
- .withColumn('gold_refresh_ts', F.current_timestamp()))
+mat("vw_campaign_performance", spark.sql(campaign_sql))
+mat("vw_adset_performance", spark.sql(adset_sql))
+mat("vw_ad_performance", u.withColumn("customer_id", F.lit(None).cast("string")))
 
-mat('vw_adset_performance', u.groupBy('platform','account_id','campaign_id','campaign_name','adset_id','adset_name','adset_status','date').agg(
-    F.sum('impressions').alias('impressions'), F.sum('clicks').alias('clicks'), F.sum('spend').alias('spend'),
-    F.sum('reach').alias('reach'), F.sum('link_clicks').alias('link_clicks'), F.countDistinct('ad_id').alias('ads_count')
-).withColumn('ctr', F.when(F.col('impressions')>0, F.col('clicks')/F.col('impressions')).otherwise(F.lit(None))) \
- .withColumn('cpc', F.when(F.col('clicks')>0, F.col('spend')/F.col('clicks')).otherwise(F.lit(None))) \
- .withColumn('cpm', F.when(F.col('impressions')>0, F.col('spend')*1000/F.col('impressions')).otherwise(F.lit(None))) \
- .withColumn('tenant_id', F.lit(None).cast('string')).withColumn('connector_id', F.lit(None).cast('string')).withColumn('customer_id', F.lit(None).cast('string')) \
- .withColumn('gold_refresh_ts', F.current_timestamp()))
-
-mat('vw_ad_performance', u.select(
-  'platform','account_id','campaign_id','campaign_name','adset_id','adset_name','ad_id','ad_name','ad_status','date',
-  'impressions','clicks','spend','reach','link_clicks',
-  F.when(F.col('impressions')>0, F.col('clicks')/F.col('impressions')).otherwise(F.lit(None)).alias('ctr'),
-  F.when(F.col('clicks')>0, F.col('spend')/F.col('clicks')).otherwise(F.lit(None)).alias('cpc'),
-  F.when(F.col('impressions')>0, F.col('spend')*1000/F.col('impressions')).otherwise(F.lit(None)).alias('cpm'),
-  F.lit(None).cast('string').alias('tenant_id'), F.lit(None).cast('string').alias('connector_id'), F.lit(None).cast('string').alias('customer_id'),
-  F.current_timestamp().alias('gold_refresh_ts')
-))
-
-wm_out = {
-  'updated_at_utc': datetime.now(timezone.utc).isoformat(),
-  'batches': current,
-  'changed_batches': list(changed.keys()),
-  'full_refresh': bool(FULL_REFRESH),
-  'counts': {
-    'unified': u.count(),
-    'vw_campaign': spark.table(f'{SCHEMA}.vw_campaign_performance').count(),
-    'vw_adset': spark.table(f'{SCHEMA}.vw_adset_performance').count(),
-    'vw_ad': spark.table(f'{SCHEMA}.vw_ad_performance').count(),
-  }
+after = {t: spark.table(f"{SCHEMA}.{t}").count() for t in before}
+wm = {
+    "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+    "mode": "incremental_merge",
+    "meta_ptrs": meta_ptrs,
+    "google_ptrs": google_ptrs,
+    "before": before,
+    "after": after,
+    "note": "Existing Gold rows kept; new/changed grain keys upserted via MERGE",
 }
-write_json(CONTROL_PATH, wm_out)
-mssparkutils.fs.put(SUMMARY_PATH, json.dumps(wm_out, indent=2), True)
-print('DONE', json.dumps(wm_out))
-mssparkutils.notebook.exit(json.dumps({'status':'success', **wm_out['counts']}))
-
+mssparkutils.fs.put(CONTROL, json.dumps(wm, indent=2), True)
+mssparkutils.fs.put(SUMMARY, json.dumps(wm, indent=2), True)
+print("DONE", json.dumps(wm, indent=2))
+mssparkutils.notebook.exit(json.dumps({"status": "success", "after": after}))
