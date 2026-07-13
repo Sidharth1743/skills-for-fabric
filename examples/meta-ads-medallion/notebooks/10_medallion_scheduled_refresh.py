@@ -183,6 +183,29 @@ google_ptrs = {
 print("META batch ptrs", {k: v for k, v in meta_ptrs.items()})
 print("GOOGLE batch ptrs", {k: v for k, v in google_ptrs.items()})
 
+# Early exit when Bronze batch pointers unchanged (avoids overlapping 5-min runs)
+FORCE_RUN = False
+try:
+    prev_wm = json.loads(mssparkutils.fs.head(CONTROL, 20000))
+except Exception:
+    prev_wm = {}
+prev_batches = {
+    "meta_ptrs": prev_wm.get("meta_ptrs"),
+    "google_ptrs": prev_wm.get("google_ptrs"),
+}
+curr_batches = {"meta_ptrs": meta_ptrs, "google_ptrs": google_ptrs}
+if (not FORCE_RUN) and prev_batches["meta_ptrs"] == curr_batches["meta_ptrs"] and prev_batches["google_ptrs"] == curr_batches["google_ptrs"]:
+    msg = {
+        "status": "skipped",
+        "reason": "no_new_bronze_batch_ptrs",
+        "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "meta_ptrs": meta_ptrs,
+        "google_ptrs": google_ptrs,
+    }
+    print("NOOP", json.dumps(msg))
+    mssparkutils.fs.put(SUMMARY, json.dumps(msg, indent=2), True)
+    mssparkutils.notebook.exit(json.dumps(msg))
+
 # -------- META dimensions + insights --------
 camp = read_csvs(list_batch_csvs(f"{META_ROOT}/meta_campaigns"))
 adset = read_csvs(list_batch_csvs(f"{META_ROOT}/meta_adsets"))
@@ -540,6 +563,92 @@ print("vw_unified sreevatsa", spark.table(f"{SCHEMA}.vw_unified_ad_performance")
 print("vw_unified geo_nonnull", spark.table(f"{SCHEMA}.vw_unified_ad_performance").filter(F.col("geo_cities").isNotNull()).count())
 
 after = {t: spark.table(f"{SCHEMA}.{t}").count() for t in before}
+
+# -------- Sync Development → Staging (exact mirror; Development unchanged) --------
+STG_SCHEMA = "Staging_Gold"
+STG_ROOT = "Files/Staging"
+DEV_ROOT = "Files/Development"
+SYNC_LAYERS = ["Bronze", "Silver", "Gold"]
+SYNC_TABLES = [
+    "rpt_meta_ad_performance_daily",
+    "rpt_google_ad_performance_daily",
+    "rpt_unified_ad_performance",
+    "vw_campaign_performance",
+    "vw_adset_performance",
+    "vw_ad_performance",
+    "vw_unified_ad_performance",
+]
+
+def _exists(path):
+    try:
+        mssparkutils.fs.ls(path)
+        return True
+    except Exception:
+        return False
+
+def _list_files(path, acc=None):
+    if acc is None:
+        acc = []
+    try:
+        items = mssparkutils.fs.ls(path)
+    except Exception:
+        return acc
+    for it in items:
+        if it.isDir:
+            _list_files(rel(it.path), acc)
+        else:
+            acc.append(rel(it.path))
+    return acc
+
+def _copy_tree(src, dst):
+    if not _exists(src):
+        return {"copied": False, "reason": "source_missing", "src": src, "dst": dst}
+    try:
+        if _exists(dst):
+            mssparkutils.fs.rm(dst, recurse=True)
+    except Exception as e:
+        return {"copied": False, "error": f"clear_failed: {e}", "src": src, "dst": dst}
+    mssparkutils.fs.mkdirs(dst)
+    mssparkutils.fs.cp(src, dst, True)
+    src_n = len(_list_files(src))
+    dst_n = len(_list_files(dst))
+    return {"copied": True, "src": src, "dst": dst, "src_file_count": src_n, "dst_file_count": dst_n, "match": src_n == dst_n}
+
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {STG_SCHEMA}")
+staging_sync = {"layers": {}, "tables": {}}
+
+for layer in SYNC_LAYERS:
+    staging_sync["layers"][layer] = _copy_tree(f"{DEV_ROOT}/{layer}", f"{STG_ROOT}/{layer}")
+    print("STAGING FILE SYNC", staging_sync["layers"][layer])
+
+for t in SYNC_TABLES:
+    src_t = f"{SCHEMA}.{t}"
+    dst_t = f"{STG_SCHEMA}.{t}"
+    try:
+        if not spark.catalog.tableExists(src_t):
+            staging_sync["tables"][t] = {"copied": False, "reason": "source_missing"}
+            continue
+        src_cnt = spark.table(src_t).count()
+        spark.sql(f"DROP TABLE IF EXISTS {dst_t}")
+        try:
+            spark.sql(f"DROP VIEW IF EXISTS {dst_t}")
+        except Exception:
+            pass
+        spark.table(src_t).write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(dst_t)
+        dst_cnt = spark.table(dst_t).count()
+        staging_sync["tables"][t] = {
+            "copied": True,
+            "src": src_t,
+            "dst": dst_t,
+            "src_count": src_cnt,
+            "dst_count": dst_cnt,
+            "match": src_cnt == dst_cnt,
+        }
+        print("STAGING TABLE SYNC", t, src_cnt, "->", dst_cnt)
+    except Exception as e:
+        staging_sync["tables"][t] = {"copied": False, "error": str(e)}
+        print("STAGING TABLE FAIL", t, e)
+
 wm = {
     "updated_at_utc": datetime.now(timezone.utc).isoformat(),
     "mode": "incremental_merge",
@@ -547,9 +656,11 @@ wm = {
     "google_ptrs": google_ptrs,
     "before": before,
     "after": after,
-    "note": "Existing Gold rows kept; new/changed grain keys upserted via MERGE",
+    "staging_sync": staging_sync,
+    "note": "Existing Gold rows kept via MERGE; Staging Files + Staging_Gold mirrored from Development after refresh",
 }
 mssparkutils.fs.put(CONTROL, json.dumps(wm, indent=2), True)
 mssparkutils.fs.put(SUMMARY, json.dumps(wm, indent=2), True)
+mssparkutils.fs.put(f"{STG_ROOT}/_copy_from_development_summary.json", json.dumps(staging_sync, indent=2), True)
 print("DONE", json.dumps(wm, indent=2))
-mssparkutils.notebook.exit(json.dumps({"status": "success", "after": after}))
+mssparkutils.notebook.exit(json.dumps({"status": "success", "after": after, "staging_ok": all(v.get("match") for v in staging_sync["tables"].values() if v.get("copied"))}))

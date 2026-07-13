@@ -47,6 +47,9 @@ Google: `google_campaigns`, `google_ad_groups`, `google_ads`, `google_ad_perform
 5. Write watermark/summary:
    - `Files/Silver/_control/medallion_pipeline_watermark.json`
    - `Files/Development/Gold/exports/pipeline_refresh_summary.txt`
+6. **Mirror Development → Staging** (exact copy; Development unchanged):
+   - `Files/Development/{Bronze,Silver,Gold}` → `Files/Staging/{Bronze,Silver,Gold}`
+   - `Gold.rpt_*` / `Gold.vw_*` → `Staging_Gold.rpt_*` / `Staging_Gold.vw_*`
 
 Grain key: `platform + account_id + campaign_id + adset_id + ad_id + full_date`
 
@@ -75,5 +78,5 @@ az rest --method post \
 ## Notes
 
 - Open **Tables → Gold → `vw_*`** (these are Delta tables, not Lakehouse Views).
-- Staging copy is separate; this pipeline updates **Development Gold** schema tables.
+- Each cron run refreshes **Development Gold**, then mirrors into **Staging Files + `Staging_Gold`**.
 - Disable schedule via PATCH `enabled: false` if you need to pause.
