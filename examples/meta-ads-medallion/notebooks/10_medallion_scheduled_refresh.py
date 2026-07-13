@@ -14,12 +14,72 @@
 
 # CELL ********************
 
-from pyspark.sql import functions as F
+from pyspark.sql import functions as F, types as T
 from pyspark.sql.window import Window
 from delta.tables import DeltaTable
 from notebookutils import mssparkutils
 from datetime import datetime, timezone
 import json, re
+
+@F.udf(T.StructType([
+    T.StructField("age_min", T.IntegerType()),
+    T.StructField("age_max", T.IntegerType()),
+    T.StructField("age_range", T.StringType()),
+    T.StructField("geo_country", T.StringType()),
+    T.StructField("geo_regions", T.StringType()),
+    T.StructField("geo_cities", T.StringType()),
+]))
+def parse_targeting(raw):
+    age_min = age_max = None
+    age_range = geo_country = geo_regions = geo_cities = None
+    try:
+        obj = json.loads(raw) if raw else {}
+        t = obj.get("targeting") or {}
+        age_min = t.get("age_min"); age_max = t.get("age_max")
+        ar = t.get("age_range")
+        if isinstance(ar, list) and len(ar) >= 2:
+            age_range = f"{ar[0]}-{ar[1]}"
+        elif age_min is not None and age_max is not None:
+            age_range = f"{age_min}-{age_max}"
+        geo = t.get("geo_locations") or {}
+        countries = list(geo.get("countries") or []); regions=[]; city_names=[]
+        def uniq(seq):
+            seen=set(); out=[]
+            for x in seq:
+                if x and x not in seen:
+                    seen.add(x); out.append(x)
+            return out
+        for c in geo.get("cities") or []:
+            if isinstance(c, dict):
+                if c.get("name"): city_names.append(c["name"])
+                if c.get("country"): countries.append(c["country"])
+                if c.get("region"): regions.append(c["region"])
+        for pl in geo.get("places") or []:
+            if isinstance(pl, dict) and pl.get("name"):
+                city_names.append(pl["name"])
+                if pl.get("country"): countries.append(pl["country"])
+        for n in geo.get("neighborhoods") or []:
+            if isinstance(n, dict) and n.get("name"):
+                city_names.append(n["name"])
+                if n.get("region"): regions.append(n["region"])
+                if n.get("country"): countries.append(n["country"])
+        for z in geo.get("zips") or []:
+            if isinstance(z, dict) and z.get("name"):
+                city_names.append("zip:" + str(z["name"]))
+                if z.get("country"): countries.append(z["country"])
+        for r in geo.get("regions") or []:
+            if isinstance(r, dict) and r.get("name"): regions.append(r["name"])
+            elif isinstance(r, str): regions.append(r)
+        countries, regions, city_names = uniq(countries), uniq(regions), uniq(city_names)
+        geo_country = ", ".join(countries) if countries else None
+        geo_regions = ", ".join(regions) if regions else None
+        geo_cities = ", ".join(city_names) if city_names else None
+        if age_min is not None: age_min = int(age_min)
+        if age_max is not None: age_max = int(age_max)
+    except Exception:
+        pass
+    return (age_min, age_max, age_range, geo_country, geo_regions, geo_cities)
+
 
 SCHEMA = "Gold"
 META_ROOT = "Files/Development/Bronze/Meta_ads"
@@ -361,7 +421,7 @@ keys_tenant = ["platform", "tenant_id", "account_id", "campaign_id", "adset_id",
 
 before = {}
 for t in ["rpt_meta_ad_performance_daily", "rpt_google_ad_performance_daily", "rpt_unified_ad_performance",
-          "vw_campaign_performance", "vw_adset_performance", "vw_ad_performance"]:
+          "vw_campaign_performance", "vw_adset_performance", "vw_ad_performance", "vw_unified_ad_performance"]:
     try:
         before[t] = spark.table(f"{SCHEMA}.{t}").count() if spark.catalog.tableExists(f"{SCHEMA}.{t}") else 0
     except Exception:
@@ -384,6 +444,50 @@ incoming = meta_for_rpt.withColumn("platform", F.lit("meta")).unionByName(
     google_for_rpt.withColumn("platform", F.lit("google")), allowMissingColumns=True
 )
 r3 = merge_into_table(incoming, "rpt_unified_ad_performance", ["platform", "account_id", "campaign_id", "adset_id", "ad_id", "full_date"])
+
+# Enrich geo/age from Meta adset targeting raw_json onto Gold facts (keeps existing rows)
+_adset_paths = list_batch_csvs(f"{META_ROOT}/meta_adsets")
+if _adset_paths:
+    _adsets = read_csvs(_adset_paths)
+    _tg = parse_targeting(F.col("raw_json"))
+    adset_geo = (
+        _adsets.filter(F.col("entity_type") == "adset")
+        .select(
+            F.get_json_object("raw_json", "$.id").alias("adset_id"),
+            _tg["age_min"].alias("age_min"), _tg["age_max"].alias("age_max"), _tg["age_range"].alias("age_range"),
+            _tg["geo_country"].alias("geo_country"), _tg["geo_regions"].alias("geo_regions"), _tg["geo_cities"].alias("geo_cities"),
+            F.col("ingestion_time").cast("timestamp").alias("ingestion_time"),
+        )
+        .filter(F.col("adset_id").isNotNull())
+        .withColumn("_rk", F.row_number().over(Window.partitionBy("adset_id").orderBy(F.col("ingestion_time").desc_nulls_last())))
+        .filter(F.col("_rk") == 1).drop("_rk", "ingestion_time")
+    )
+    print("adset_geo", adset_geo.count(), "geo_nonnull", adset_geo.filter(F.col("geo_cities").isNotNull()).count())
+    for _tbl in ["rpt_meta_ad_performance_daily", "rpt_unified_ad_performance"]:
+        _full = f"{SCHEMA}.{_tbl}"
+        if not spark.catalog.tableExists(_full):
+            continue
+        _loc = spark.sql(f"DESCRIBE DETAIL {_full}").collect()[0]["location"]
+        _upd = (
+            spark.table(_full).alias("t").join(adset_geo.alias("g"), "adset_id", "inner")
+            .select(
+                F.col("t.platform"), F.col("t.account_id"), F.col("t.campaign_id"), F.col("t.adset_id"), F.col("t.ad_id"), F.col("t.full_date"),
+                F.col("g.age_min").cast("string").alias("age_min"), F.col("g.age_max").cast("string").alias("age_max"),
+                F.col("g.age_range"), F.col("g.geo_country"), F.col("g.geo_regions"), F.col("g.geo_cities"),
+            ).dropDuplicates(["platform","account_id","campaign_id","adset_id","ad_id","full_date"])
+        )
+        if _upd.rdd.isEmpty():
+            continue
+        _cond = " AND ".join([
+            "t.platform <=> s.platform","t.account_id <=> s.account_id","t.campaign_id <=> s.campaign_id",
+            "t.adset_id <=> s.adset_id","t.ad_id <=> s.ad_id","t.full_date <=> s.full_date",
+        ])
+        (DeltaTable.forPath(spark, _loc).alias("t").merge(_upd.alias("s"), _cond)
+         .whenMatchedUpdate(set={
+             "age_min":"s.age_min","age_max":"s.age_max","age_range":"s.age_range",
+             "geo_country":"s.geo_country","geo_regions":"s.geo_regions","geo_cities":"s.geo_cities",
+         }).execute())
+        print("geo merged into", _full, "geo_nonnull", spark.table(_full).filter(F.col("geo_cities").isNotNull()).count())
 
 # Rematerialize views from unified (full rebuild of vw only; fact data preserved via merge above)
 SRC = f"{SCHEMA}.rpt_unified_ad_performance"
@@ -431,6 +535,9 @@ def mat(name, df):
 mat("vw_campaign_performance", spark.sql(campaign_sql))
 mat("vw_adset_performance", spark.sql(adset_sql))
 mat("vw_ad_performance", u.withColumn("customer_id", F.lit(None).cast("string")))
+mat("vw_unified_ad_performance", u)
+print("vw_unified sreevatsa", spark.table(f"{SCHEMA}.vw_unified_ad_performance").filter(F.lower(F.col("account_name")).contains("sreevatsa")).count())
+print("vw_unified geo_nonnull", spark.table(f"{SCHEMA}.vw_unified_ad_performance").filter(F.col("geo_cities").isNotNull()).count())
 
 after = {t: spark.table(f"{SCHEMA}.{t}").count() for t in before}
 wm = {
