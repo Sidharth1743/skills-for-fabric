@@ -81,8 +81,8 @@ def parse_targeting(raw):
     return (age_min, age_max, age_range, geo_country, geo_regions, geo_cities)
 
 
-SCHEMA = "Gold"
-STG_SCHEMA = "Staging_Gold"
+# Gold MERGEs / vw_* write ONLY to Staging_Gold (Development Gold.* is left untouched)
+SCHEMA = "Staging_Gold"
 DEV_ROOT = "Files/Development"
 STG_ROOT = "Files/Staging"
 CONTROL = "Files/Silver/_control/medallion_pipeline_watermark.json"
@@ -113,7 +113,6 @@ SILVER_GOOGLE_ROOTS = [
 ]
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {STG_SCHEMA}")
 
 def rel(p):
     return ("Files/" + p.split("/Files/", 1)[1]) if "/Files/" in p else p
@@ -751,7 +750,7 @@ for platform_folder in ["Meta_ads", "Google_ads"]:
         bronze_sync[key].append(info)
         print("BRONZE SYNC", info)
 
-# -------- Mirror Gold managed tables → Staging_Gold --------
+# Export Staging_Gold Delta snapshots under Staging Files/Gold/tables only (not Development)
 SYNC_TABLES = [
     "rpt_meta_ad_performance_daily",
     "rpt_google_ad_performance_daily",
@@ -761,50 +760,24 @@ SYNC_TABLES = [
     "vw_ad_performance",
     "vw_unified_ad_performance",
 ]
-staging_tables = {}
-for t in SYNC_TABLES:
-    src_t = f"{SCHEMA}.{t}"
-    dst_t = f"{STG_SCHEMA}.{t}"
-    try:
-        if not spark.catalog.tableExists(src_t):
-            staging_tables[t] = {"copied": False, "reason": "source_missing"}
-            continue
-        src_cnt = spark.table(src_t).count()
-        spark.sql(f"DROP TABLE IF EXISTS {dst_t}")
-        try:
-            spark.sql(f"DROP VIEW IF EXISTS {dst_t}")
-        except Exception:
-            pass
-        spark.table(src_t).write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(dst_t)
-        dst_cnt = spark.table(dst_t).count()
-        staging_tables[t] = {
-            "copied": True, "src": src_t, "dst": dst_t,
-            "src_count": src_cnt, "dst_count": dst_cnt, "match": src_cnt == dst_cnt,
-        }
-        print("STAGING_GOLD", t, src_cnt, "->", dst_cnt)
-    except Exception as e:
-        staging_tables[t] = {"copied": False, "error": str(e)}
-        print("STAGING_GOLD FAIL", t, e)
-
-# Also export Gold Delta snapshots under Development + Staging Files/Gold/tables
 gold_file_sync = []
 for t in SYNC_TABLES:
     if not spark.catalog.tableExists(f"{SCHEMA}.{t}"):
         continue
     df = spark.table(f"{SCHEMA}.{t}")
-    for root in [f"{DEV_ROOT}/Gold/tables", f"{STG_ROOT}/Gold/tables"]:
-        path = f"{root}/{t}"
-        try:
-            mssparkutils.fs.mkdirs(root)
-            df.write.format("delta").mode("overwrite").option("overwriteSchema", True).save(path)
-            gold_file_sync.append({"path": path, "rows": df.count(), "ok": True})
-            print("GOLD FILES", path)
-        except Exception as e:
-            gold_file_sync.append({"path": path, "ok": False, "error": str(e)[:200]})
+    root = f"{STG_ROOT}/Gold/tables"
+    path = f"{root}/{t}"
+    try:
+        mssparkutils.fs.mkdirs(root)
+        df.write.format("delta").mode("overwrite").option("overwriteSchema", True).save(path)
+        gold_file_sync.append({"path": path, "rows": df.count(), "ok": True})
+        print("STAGING_GOLD FILES", path)
+    except Exception as e:
+        gold_file_sync.append({"path": path, "ok": False, "error": str(e)[:200]})
 
 wm = {
     "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-    "mode": "incremental_merge_dual_bronze",
+    "mode": "incremental_merge_staging_gold_only",
     "bronze_roots": {"meta": META_ROOTS, "google": GOOGLE_ROOTS},
     "meta_ptrs": meta_ptrs,
     "google_ptrs": google_ptrs,
@@ -812,9 +785,8 @@ wm = {
     "after": after,
     "silver_sync": silver_sync,
     "bronze_sync": bronze_sync,
-    "staging_gold": staging_tables,
     "gold_file_sync": gold_file_sync,
-    "note": "Ingests Development+Staging Bronze; MERGEs Gold; writes Silver to Dev+Staging; mirrors Staging_Gold; bidirectional Bronze fill",
+    "note": "Ingests Development+Staging Bronze; MERGEs ONLY Staging_Gold (Development Gold untouched); writes Silver to Dev+Staging; bidirectional Bronze fill",
 }
 mssparkutils.fs.put(CONTROL, json.dumps(wm, indent=2), True)
 mssparkutils.fs.mkdirs("Files/Development/Gold/exports")
@@ -824,11 +796,11 @@ mssparkutils.fs.put(SUMMARY_STG, json.dumps(wm, indent=2), True)
 mssparkutils.fs.put(f"{STG_ROOT}/_copy_from_development_summary.json", json.dumps({
     "bronze_sync": bronze_sync,
     "silver_sync": silver_sync,
-    "staging_gold": staging_tables,
+    "schema": SCHEMA,
 }, indent=2), True)
 print("DONE", json.dumps({k: wm[k] for k in ["updated_at_utc", "before", "after"]}, indent=2))
 mssparkutils.notebook.exit(json.dumps({
     "status": "success",
     "after": after,
-    "staging_ok": all(v.get("match") for v in staging_tables.values() if v.get("copied")),
+    "schema": SCHEMA,
 }))
