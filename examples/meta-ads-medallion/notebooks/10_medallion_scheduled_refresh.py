@@ -82,15 +82,62 @@ def parse_targeting(raw):
 
 
 SCHEMA = "Gold"
-META_ROOT = "Files/Development/Bronze/Meta_ads"
-GOOGLE_ROOT = "Files/Development/Bronze/Google_ads"
+STG_SCHEMA = "Staging_Gold"
+DEV_ROOT = "Files/Development"
+STG_ROOT = "Files/Staging"
 CONTROL = "Files/Silver/_control/medallion_pipeline_watermark.json"
 SUMMARY = "Files/Development/Gold/exports/pipeline_refresh_summary.txt"
+SUMMARY_STG = "Files/Staging/Gold/exports/pipeline_refresh_summary.txt"
+
+# Bronze lands in Development and/or Staging (incl. legacy nested Staging/Bronze/Bronze)
+META_ROOTS = [
+    f"{DEV_ROOT}/Bronze/Meta_ads",
+    f"{STG_ROOT}/Bronze/Meta_ads",
+    f"{STG_ROOT}/Bronze/Bronze/Meta_ads",
+]
+GOOGLE_ROOTS = [
+    f"{DEV_ROOT}/Bronze/Google_ads",
+    f"{STG_ROOT}/Bronze/Google_ads",
+    f"{STG_ROOT}/Bronze/Bronze/Google_ads",
+]
+
+# Silver Delta file roots written after each successful refresh
+SILVER_META_ROOTS = [
+    f"{DEV_ROOT}/Silver/meta_ads",
+    f"{STG_ROOT}/Silver/meta_ads",
+    "Files/Silver/meta_ads",
+]
+SILVER_GOOGLE_ROOTS = [
+    f"{DEV_ROOT}/Silver/GoogleAds",
+    f"{STG_ROOT}/Silver/GoogleAds",
+]
 
 spark.sql(f"CREATE SCHEMA IF NOT EXISTS {SCHEMA}")
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {STG_SCHEMA}")
 
 def rel(p):
     return ("Files/" + p.split("/Files/", 1)[1]) if "/Files/" in p else p
+
+def _exists(path):
+    try:
+        mssparkutils.fs.ls(path)
+        return True
+    except Exception:
+        return False
+
+def _list_files(path, acc=None):
+    if acc is None:
+        acc = []
+    try:
+        items = mssparkutils.fs.ls(path)
+    except Exception:
+        return acc
+    for it in items:
+        if it.isDir:
+            _list_files(rel(it.path), acc)
+        else:
+            acc.append(rel(it.path))
+    return acc
 
 def list_batch_csvs(folder):
     try:
@@ -101,6 +148,16 @@ def list_batch_csvs(folder):
     batch = [rel(i.path) for i in items if (not i.isDir) and i.name.endswith(".csv") and not i.name.endswith("_latest.csv")]
     latest = [rel(i.path) for i in items if (not i.isDir) and i.name.endswith("_latest.csv")]
     return batch if batch else latest
+
+def list_batch_csvs_multi(roots, entity):
+    """Union batch CSVs across Development + Staging bronze roots; dedupe by filename."""
+    seen = {}
+    for root in roots:
+        for p in list_batch_csvs(f"{root}/{entity}"):
+            seen[p.rsplit("/", 1)[-1]] = p
+    paths = list(seen.values())
+    print(f"[CSV] {entity}: {len(paths)} files from {len(roots)} roots")
+    return paths
 
 def read_csvs(paths):
     if not paths:
@@ -134,13 +191,18 @@ def collect_batch_ptrs(root, entity):
     walk(base)
     return sorted(set([x for x in found if x]))
 
-def merge_into_table(df, table_name, keys):
+def collect_batch_ptrs_multi(roots, entity):
+    found = []
+    for root in roots:
+        found.extend(collect_batch_ptrs(root, entity))
+    return sorted(set(found))
+
+def merge_into_table(df, table_name, keys, schema=SCHEMA):
     """MERGE upsert — never deletes existing unmatched rows."""
-    full = f"{SCHEMA}.{table_name}"
+    full = f"{schema}.{table_name}"
     if df is None or df.rdd.isEmpty():
         print("[SKIP empty]", full)
         return {"table": full, "skipped": True}
-    # align to existing columns when table exists
     if spark.catalog.tableExists(full):
         target = spark.table(full)
         tcols = target.columns
@@ -167,18 +229,90 @@ def merge_into_table(df, table_name, keys):
         print("[CREATE]", full, "rows=", cnt)
         return {"table": full, "count": cnt, "created": True}
 
-# -------- discover --------
+def merge_into_path(df, path, keys):
+    """MERGE upsert into a Files/ Delta path (Silver layer)."""
+    if df is None or df.rdd.isEmpty():
+        return {"path": path, "skipped": True}
+    df = df.dropDuplicates(keys)
+    try:
+        is_delta = DeltaTable.isDeltaTable(spark, path)
+    except Exception:
+        is_delta = False
+    if is_delta:
+        existing = spark.read.format("delta").load(path)
+        for c in existing.columns:
+            if c not in df.columns:
+                df = df.withColumn(c, F.lit(None))
+        # keep source columns even if new
+        cols = list(dict.fromkeys(list(existing.columns) + [c for c in df.columns if c not in existing.columns]))
+        for c in cols:
+            if c not in df.columns:
+                df = df.withColumn(c, F.lit(None))
+        df = df.select(*cols)
+        cond = " AND ".join([f"t.`{k}` <=> s.`{k}`" for k in keys if k in cols])
+        (
+            DeltaTable.forPath(spark, path).alias("t")
+            .merge(df.alias("s"), cond)
+            .whenMatchedUpdateAll()
+            .whenNotMatchedInsertAll()
+            .execute()
+        )
+        cnt = spark.read.format("delta").load(path).count()
+        print("[SILVER MERGE]", path, "rows=", cnt)
+        return {"path": path, "count": cnt, "merged": True}
+    mssparkutils.fs.mkdirs(path.rsplit("/", 1)[0])
+    df.write.format("delta").mode("overwrite").option("overwriteSchema", True).save(path)
+    cnt = spark.read.format("delta").load(path).count()
+    print("[SILVER CREATE]", path, "rows=", cnt)
+    return {"path": path, "count": cnt, "created": True}
+
+def write_silver_multi(df, relative_name, keys, roots):
+    results = []
+    for root in roots:
+        results.append(merge_into_path(df, f"{root}/{relative_name}", keys))
+    return results
+
+def sync_missing_files(src_root, dst_root):
+    """Copy files present in src but missing under dst (same relative path). Does not delete."""
+    if not _exists(src_root):
+        return {"copied": 0, "reason": "source_missing", "src": src_root, "dst": dst_root}
+    mssparkutils.fs.mkdirs(dst_root)
+    src_files = _list_files(src_root)
+    copied = 0
+    errors = []
+    for sp in src_files:
+        rel_part = sp[len(src_root):].lstrip("/")
+        dp = f"{dst_root}/{rel_part}"
+        try:
+            # exists check via ls parent + name is expensive; try head/ls
+            parent = dp.rsplit("/", 1)[0]
+            name = dp.rsplit("/", 1)[-1]
+            present = False
+            try:
+                present = any((not it.isDir) and it.name == name for it in mssparkutils.fs.ls(parent))
+            except Exception:
+                present = False
+            if present:
+                continue
+            mssparkutils.fs.mkdirs(parent)
+            mssparkutils.fs.cp(sp, dp, False)
+            copied += 1
+        except Exception as e:
+            errors.append({"src": sp, "dst": dp, "error": str(e)[:200]})
+    return {"src": src_root, "dst": dst_root, "src_files": len(src_files), "copied": copied, "errors": errors[:10]}
+
+# -------- discover (Development + Staging Bronze) --------
 meta_ptrs = {
-    "meta_campaigns": collect_batch_ptrs(META_ROOT, "meta_campaigns"),
-    "meta_adsets": collect_batch_ptrs(META_ROOT, "meta_adsets"),
-    "meta_ads": collect_batch_ptrs(META_ROOT, "meta_ads"),
-    "meta_ad_insights": collect_batch_ptrs(META_ROOT, "meta_ad_insights"),
+    "meta_campaigns": collect_batch_ptrs_multi(META_ROOTS, "meta_campaigns"),
+    "meta_adsets": collect_batch_ptrs_multi(META_ROOTS, "meta_adsets"),
+    "meta_ads": collect_batch_ptrs_multi(META_ROOTS, "meta_ads"),
+    "meta_ad_insights": collect_batch_ptrs_multi(META_ROOTS, "meta_ad_insights"),
 }
 google_ptrs = {
-    "google_campaigns": collect_batch_ptrs(GOOGLE_ROOT, "google_campaigns"),
-    "google_ad_groups": collect_batch_ptrs(GOOGLE_ROOT, "google_ad_groups"),
-    "google_ads": collect_batch_ptrs(GOOGLE_ROOT, "google_ads"),
-    "google_ad_performance": collect_batch_ptrs(GOOGLE_ROOT, "google_ad_performance"),
+    "google_campaigns": collect_batch_ptrs_multi(GOOGLE_ROOTS, "google_campaigns"),
+    "google_ad_groups": collect_batch_ptrs_multi(GOOGLE_ROOTS, "google_ad_groups"),
+    "google_ads": collect_batch_ptrs_multi(GOOGLE_ROOTS, "google_ads"),
+    "google_ad_performance": collect_batch_ptrs_multi(GOOGLE_ROOTS, "google_ad_performance"),
 }
 print("META batch ptrs", {k: v for k, v in meta_ptrs.items()})
 print("GOOGLE batch ptrs", {k: v for k, v in google_ptrs.items()})
@@ -199,39 +333,27 @@ if (not FORCE_RUN) and prev_batches["meta_ptrs"] == curr_batches["meta_ptrs"] an
         "status": "skipped",
         "reason": "no_new_bronze_batch_ptrs",
         "updated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "bronze_roots": {"meta": META_ROOTS, "google": GOOGLE_ROOTS},
         "meta_ptrs": meta_ptrs,
         "google_ptrs": google_ptrs,
     }
     print("NOOP", json.dumps(msg))
     mssparkutils.fs.put(SUMMARY, json.dumps(msg, indent=2), True)
+    try:
+        mssparkutils.fs.mkdirs("Files/Staging/Gold/exports")
+        mssparkutils.fs.put(SUMMARY_STG, json.dumps(msg, indent=2), True)
+    except Exception:
+        pass
     mssparkutils.notebook.exit(json.dumps(msg))
 
-# -------- META dimensions + insights --------
-camp = read_csvs(list_batch_csvs(f"{META_ROOT}/meta_campaigns"))
-adset = read_csvs(list_batch_csvs(f"{META_ROOT}/meta_adsets"))
-ads = read_csvs(list_batch_csvs(f"{META_ROOT}/meta_ads"))
-ins = read_csvs(list_batch_csvs(f"{META_ROOT}/meta_ad_insights"))
+# -------- META dimensions + insights (union Dev + Staging CSVs) --------
+camp = read_csvs(list_batch_csvs_multi(META_ROOTS, "meta_campaigns"))
+adset = read_csvs(list_batch_csvs_multi(META_ROOTS, "meta_adsets"))
+ads = read_csvs(list_batch_csvs_multi(META_ROOTS, "meta_ads"))
+ins = read_csvs(list_batch_csvs_multi(META_ROOTS, "meta_ad_insights"))
 
-def parse_meta_dim(df, entity, id_field, extra_schema):
-    if df is None:
-        return None
-    j = F.from_json(F.col("raw_json"), extra_schema)
-    return (
-        df.filter(F.col("entity_type") == entity)
-        .withColumn("j", j)
-        .select(
-            F.col("tenant_id"), F.col("connector_id"), F.col("account_id"), F.col("account_name"),
-            F.col("batch_id"), F.col("ingestion_time").cast("timestamp").alias("ingestion_time"),
-            F.col("j.id").alias(id_field),
-            F.col("j.name").alias(id_field.replace("_id", "_name") if id_field.endswith("_id") else "name"),
-            F.col("j.status").alias("status"),
-            F.col("j.*"),
-        )
-    )
-
-# Insights are the grain for gold facts
 if ins is None:
-    raise Exception("No meta_ad_insights CSV found under Development Bronze")
+    raise Exception("No meta_ad_insights CSV found under Development or Staging Bronze")
 
 ins_j = F.from_json(
     F.col("raw_json"),
@@ -240,44 +362,51 @@ ins_j = F.from_json(
     "spend STRING, ctr STRING, cpc STRING, cpm STRING, cpp STRING, unique_ctr STRING, date_start STRING, date_stop STRING, "
     "actions STRING"
 )
-meta_fact = (
+meta_silver = (
     ins.filter(F.col("entity_type") == "ad_insight")
     .withColumn("j", ins_j)
     .select(
+        F.col("connector_id"), F.col("tenant_id"), F.col("account_id"), F.col("account_name"),
         F.lit("meta").alias("platform"),
-        F.col("tenant_id"), F.col("connector_id"), F.col("account_id"), F.col("account_name"),
-        F.col("j.campaign_id").alias("campaign_id"), F.col("j.campaign_name").alias("campaign_name"),
-        F.col("j.adset_id").alias("adset_id"), F.col("j.adset_name").alias("adset_name"),
-        F.col("j.ad_id").alias("ad_id"), F.col("j.ad_name").alias("ad_name"),
-        F.to_date("j.date_start").alias("full_date"),
+        F.col("batch_id"),
+        F.col("ingestion_time").cast("timestamp").alias("ingestion_time"),
+        F.col("j.ad_id").alias("ad_id"),
+        F.col("j.adset_id").alias("adset_id"),
+        F.col("j.campaign_id").alias("campaign_id"),
+        F.col("j.ad_name").alias("ad_name"),
+        F.col("j.adset_name").alias("adset_name"),
+        F.col("j.campaign_name").alias("campaign_name"),
+        F.to_date("j.date_start").alias("date_start"),
+        F.to_date("j.date_stop").alias("date_stop"),
         F.col("j.impressions").cast("long").alias("impressions"),
-        F.col("j.reach").cast("long").alias("reach"),
-        F.col("j.frequency").cast("double").alias("frequency"),
         F.col("j.clicks").cast("long").alias("clicks"),
         F.col("j.unique_clicks").cast("long").alias("unique_clicks"),
         F.col("j.inline_link_clicks").cast("long").alias("inline_link_clicks"),
+        F.col("j.reach").cast("long").alias("reach"),
         F.col("j.spend").cast("double").alias("spend"),
+        F.col("j.frequency").cast("double").alias("frequency"),
         F.col("j.ctr").cast("double").alias("ctr"),
+        F.col("j.unique_ctr").cast("double").alias("unique_ctr"),
         F.col("j.cpc").cast("double").alias("cpc"),
         F.col("j.cpm").cast("double").alias("cpm"),
         F.col("j.cpp").cast("double").alias("cpp"),
-        F.col("j.unique_ctr").cast("double").alias("unique_ctr"),
-        F.col("j.inline_link_clicks").cast("long").alias("link_clicks"),
-        F.current_timestamp().alias("gold_processed_at"),
-        F.col("batch_id"),
-        F.col("ingestion_time").cast("timestamp").alias("ingestion_time"),
     )
-    .filter(F.col("full_date").isNotNull() & F.col("ad_id").isNotNull())
+    .filter(F.col("date_start").isNotNull() & F.col("ad_id").isNotNull())
 )
-meta_fact = meta_fact.withColumn(
+meta_silver = meta_silver.withColumn(
     "_rk",
     F.row_number().over(
-        Window.partitionBy("tenant_id", "account_id", "campaign_id", "adset_id", "ad_id", "full_date")
+        Window.partitionBy("tenant_id", "account_id", "campaign_id", "adset_id", "ad_id", "date_start")
         .orderBy(F.col("ingestion_time").desc_nulls_last())
     ),
 ).filter(F.col("_rk") == 1).drop("_rk")
 
-# enrich calendar fields
+meta_fact = (
+    meta_silver
+    .withColumn("full_date", F.col("date_start"))
+    .withColumn("link_clicks", F.col("inline_link_clicks"))
+    .withColumn("gold_processed_at", F.current_timestamp())
+)
 meta_fact = (
     meta_fact
     .withColumn("year", F.year("full_date").cast("string"))
@@ -326,13 +455,13 @@ meta_fact = (
 print("meta_fact", meta_fact.count())
 
 # -------- GOOGLE --------
-gperf = read_csvs(list_batch_csvs(f"{GOOGLE_ROOT}/google_ad_performance"))
-gcamp = read_csvs(list_batch_csvs(f"{GOOGLE_ROOT}/google_campaigns"))
-gadg = read_csvs(list_batch_csvs(f"{GOOGLE_ROOT}/google_ad_groups"))
-gads = read_csvs(list_batch_csvs(f"{GOOGLE_ROOT}/google_ads"))
+gperf = read_csvs(list_batch_csvs_multi(GOOGLE_ROOTS, "google_ad_performance"))
+gcamp = read_csvs(list_batch_csvs_multi(GOOGLE_ROOTS, "google_campaigns"))
+gadg = read_csvs(list_batch_csvs_multi(GOOGLE_ROOTS, "google_ad_groups"))
+gads = read_csvs(list_batch_csvs_multi(GOOGLE_ROOTS, "google_ads"))
 
 if gperf is None:
-    raise Exception("No google_ad_performance CSV found")
+    raise Exception("No google_ad_performance CSV found under Development or Staging Bronze")
 
 gp_j = F.from_json(
     F.col("raw_json"),
@@ -340,7 +469,6 @@ gp_j = F.from_json(
     "ctr STRING, average_cpc STRING, cost_micros STRING, cost STRING, conversions STRING, conversions_value STRING, "
     "cost_per_conversion STRING, roas STRING"
 )
-# dim names
 gc_j = F.from_json(F.col("raw_json"), "campaign_id STRING, campaign_name STRING, status STRING, channel_type STRING")
 ga_j = F.from_json(F.col("raw_json"), "adgroup_id STRING, adgroup_name STRING, campaign_id STRING, status STRING")
 gad_j = F.from_json(F.col("raw_json"), "ad_id STRING, ad_name STRING, adgroup_id STRING, campaign_id STRING, status STRING")
@@ -374,12 +502,14 @@ if gads is not None:
         .filter(F.col("_rk") == 1).drop("_rk", "ingestion_time")
     )
 
-google_fact = (
+google_silver = (
     gperf.filter(F.col("entity_type") == "ad_performance")
     .withColumn("j", gp_j)
     .select(
+        F.col("connector_id"), F.col("tenant_id"), F.col("account_id"), F.col("account_name"),
         F.lit("google").alias("platform"),
-        F.col("tenant_id"), F.col("connector_id"), F.col("account_id"), F.col("account_name"),
+        F.col("batch_id"),
+        F.col("ingestion_time").cast("timestamp").alias("ingestion_time"),
         F.col("j.campaign_id").alias("campaign_id"),
         F.col("j.adgroup_id").alias("adset_id"),
         F.col("j.ad_id").alias("ad_id"),
@@ -393,26 +523,23 @@ google_fact = (
         F.col("j.conversions_value").cast("double").alias("conversions_value"),
         F.col("j.cost_per_conversion").cast("double").alias("cost_per_conversion"),
         F.col("j.roas").cast("double").alias("roas"),
-        F.current_timestamp().alias("gold_processed_at"),
-        F.col("batch_id"),
-        F.col("ingestion_time").cast("timestamp").alias("ingestion_time"),
     )
     .filter(F.col("full_date").isNotNull() & F.col("ad_id").isNotNull())
 )
 if gc_dim is not None:
-    google_fact = google_fact.join(gc_dim, "campaign_id", "left")
+    google_silver = google_silver.join(gc_dim, "campaign_id", "left")
 else:
-    google_fact = google_fact.withColumn("campaign_name", F.lit(None).cast("string")).withColumn("campaign_status", F.lit(None).cast("string")).withColumn("campaign_channel_or_objective", F.lit(None).cast("string"))
+    google_silver = google_silver.withColumn("campaign_name", F.lit(None).cast("string")).withColumn("campaign_status", F.lit(None).cast("string")).withColumn("campaign_channel_or_objective", F.lit(None).cast("string"))
 if ga_dim is not None:
-    google_fact = google_fact.join(ga_dim, "adset_id", "left")
+    google_silver = google_silver.join(ga_dim, "adset_id", "left")
 else:
-    google_fact = google_fact.withColumn("adset_name", F.lit(None).cast("string")).withColumn("adset_status", F.lit(None).cast("string"))
+    google_silver = google_silver.withColumn("adset_name", F.lit(None).cast("string")).withColumn("adset_status", F.lit(None).cast("string"))
 if gad_dim is not None:
-    google_fact = google_fact.join(gad_dim, "ad_id", "left")
+    google_silver = google_silver.join(gad_dim, "ad_id", "left")
 else:
-    google_fact = google_fact.withColumn("ad_name", F.lit(None).cast("string")).withColumn("ad_status", F.lit(None).cast("string"))
+    google_silver = google_silver.withColumn("ad_name", F.lit(None).cast("string")).withColumn("ad_status", F.lit(None).cast("string"))
 
-google_fact = google_fact.withColumn(
+google_silver = google_silver.withColumn(
     "_rk",
     F.row_number().over(
         Window.partitionBy("tenant_id", "account_id", "campaign_id", "adset_id", "ad_id", "full_date")
@@ -421,7 +548,8 @@ google_fact = google_fact.withColumn(
 ).filter(F.col("_rk") == 1).drop("_rk")
 
 google_fact = (
-    google_fact
+    google_silver
+    .withColumn("gold_processed_at", F.current_timestamp())
     .withColumn("year", F.year("full_date").cast("string"))
     .withColumn("month", F.month("full_date").cast("string"))
     .withColumn("month_name", F.date_format("full_date", "MMMM"))
@@ -438,10 +566,6 @@ google_fact = (
 )
 print("google_fact", google_fact.count())
 
-keys = ["platform", "account_id", "campaign_id", "adset_id", "ad_id", "full_date"]
-# optional stronger key with tenant
-keys_tenant = ["platform", "tenant_id", "account_id", "campaign_id", "adset_id", "ad_id", "full_date"]
-
 before = {}
 for t in ["rpt_meta_ad_performance_daily", "rpt_google_ad_performance_daily", "rpt_unified_ad_performance",
           "vw_campaign_performance", "vw_adset_performance", "vw_ad_performance", "vw_unified_ad_performance"]:
@@ -451,25 +575,35 @@ for t in ["rpt_meta_ad_performance_daily", "rpt_google_ad_performance_daily", "r
         before[t] = 0
 print("BEFORE", before)
 
-# MERGE platform facts
-meta_for_rpt = meta_fact.drop("batch_id", "ingestion_time")
+# -------- Silver file writes (Development + Staging + Files/Silver) --------
+silver_sync = {"meta": [], "google": []}
+silver_sync["meta"] = write_silver_multi(
+    meta_silver,
+    "silver_meta_ad_insights",
+    ["tenant_id", "account_id", "campaign_id", "adset_id", "ad_id", "date_start"],
+    SILVER_META_ROOTS,
+)
+silver_sync["google"] = write_silver_multi(
+    google_silver,
+    "silver_google_ad_performance",
+    ["tenant_id", "account_id", "campaign_id", "adset_id", "ad_id", "full_date"],
+    SILVER_GOOGLE_ROOTS,
+)
+
+# -------- Gold MERGE --------
+meta_for_rpt = meta_fact.drop("batch_id", "ingestion_time", "date_start", "date_stop")
 google_for_rpt = google_fact.drop("batch_id", "ingestion_time")
 
-# Use keys without requiring tenant match if historical rows lack tenant consistency
 r1 = merge_into_table(meta_for_rpt, "rpt_meta_ad_performance_daily", ["account_id", "campaign_id", "adset_id", "ad_id", "full_date"])
 r2 = merge_into_table(google_for_rpt, "rpt_google_ad_performance_daily", ["account_id", "campaign_id", "adset_id", "ad_id", "full_date"])
 
-# unified = union of both facts aligned to existing unified schema
-meta_u = spark.table(f"{SCHEMA}.rpt_meta_ad_performance_daily").withColumn("platform", F.coalesce(F.col("platform"), F.lit("meta")))
-google_u = spark.table(f"{SCHEMA}.rpt_google_ad_performance_daily").withColumn("platform", F.coalesce(F.col("platform"), F.lit("google")))
-# Prefer merging incoming facts into unified directly
 incoming = meta_for_rpt.withColumn("platform", F.lit("meta")).unionByName(
     google_for_rpt.withColumn("platform", F.lit("google")), allowMissingColumns=True
 )
 r3 = merge_into_table(incoming, "rpt_unified_ad_performance", ["platform", "account_id", "campaign_id", "adset_id", "ad_id", "full_date"])
 
-# Enrich geo/age from Meta adset targeting raw_json onto Gold facts (keeps existing rows)
-_adset_paths = list_batch_csvs(f"{META_ROOT}/meta_adsets")
+# Enrich geo/age from Meta adset targeting (all bronze roots)
+_adset_paths = list_batch_csvs_multi(META_ROOTS, "meta_adsets")
 if _adset_paths:
     _adsets = read_csvs(_adset_paths)
     _tg = parse_targeting(F.col("raw_json"))
@@ -512,7 +646,7 @@ if _adset_paths:
          }).execute())
         print("geo merged into", _full, "geo_nonnull", spark.table(_full).filter(F.col("geo_cities").isNotNull()).count())
 
-# Rematerialize views from unified (full rebuild of vw only; fact data preserved via merge above)
+# Rematerialize views from unified
 SRC = f"{SCHEMA}.rpt_unified_ad_performance"
 u = spark.table(SRC)
 campaign_sql = f"""
@@ -559,16 +693,26 @@ mat("vw_campaign_performance", spark.sql(campaign_sql))
 mat("vw_adset_performance", spark.sql(adset_sql))
 mat("vw_ad_performance", u.withColumn("customer_id", F.lit(None).cast("string")))
 mat("vw_unified_ad_performance", u)
-print("vw_unified sreevatsa", spark.table(f"{SCHEMA}.vw_unified_ad_performance").filter(F.lower(F.col("account_name")).contains("sreevatsa")).count())
-print("vw_unified geo_nonnull", spark.table(f"{SCHEMA}.vw_unified_ad_performance").filter(F.col("geo_cities").isNotNull()).count())
 
 after = {t: spark.table(f"{SCHEMA}.{t}").count() for t in before}
 
-# -------- Sync Development → Staging (exact mirror; Development unchanged) --------
-STG_SCHEMA = "Staging_Gold"
-STG_ROOT = "Files/Staging"
-DEV_ROOT = "Files/Development"
-SYNC_LAYERS = ["Bronze", "Silver", "Gold"]
+# -------- Bidirectional Bronze sync (do NOT wipe Staging-only landings) --------
+bronze_sync = {"dev_to_stg": [], "stg_to_dev": []}
+for platform_folder in ["Meta_ads", "Google_ads"]:
+    pairs = [
+        (f"{DEV_ROOT}/Bronze/{platform_folder}", f"{STG_ROOT}/Bronze/{platform_folder}"),
+        (f"{STG_ROOT}/Bronze/{platform_folder}", f"{DEV_ROOT}/Bronze/{platform_folder}"),
+        # pull legacy nested Staging copy into canonical Staging + Development
+        (f"{STG_ROOT}/Bronze/Bronze/{platform_folder}", f"{STG_ROOT}/Bronze/{platform_folder}"),
+        (f"{STG_ROOT}/Bronze/Bronze/{platform_folder}", f"{DEV_ROOT}/Bronze/{platform_folder}"),
+    ]
+    for src, dst in pairs:
+        info = sync_missing_files(src, dst)
+        key = "dev_to_stg" if src.startswith(DEV_ROOT) else "stg_to_dev"
+        bronze_sync[key].append(info)
+        print("BRONZE SYNC", info)
+
+# -------- Mirror Gold managed tables → Staging_Gold --------
 SYNC_TABLES = [
     "rpt_meta_ad_performance_daily",
     "rpt_google_ad_performance_daily",
@@ -578,55 +722,13 @@ SYNC_TABLES = [
     "vw_ad_performance",
     "vw_unified_ad_performance",
 ]
-
-def _exists(path):
-    try:
-        mssparkutils.fs.ls(path)
-        return True
-    except Exception:
-        return False
-
-def _list_files(path, acc=None):
-    if acc is None:
-        acc = []
-    try:
-        items = mssparkutils.fs.ls(path)
-    except Exception:
-        return acc
-    for it in items:
-        if it.isDir:
-            _list_files(rel(it.path), acc)
-        else:
-            acc.append(rel(it.path))
-    return acc
-
-def _copy_tree(src, dst):
-    if not _exists(src):
-        return {"copied": False, "reason": "source_missing", "src": src, "dst": dst}
-    try:
-        if _exists(dst):
-            mssparkutils.fs.rm(dst, recurse=True)
-    except Exception as e:
-        return {"copied": False, "error": f"clear_failed: {e}", "src": src, "dst": dst}
-    mssparkutils.fs.mkdirs(dst)
-    mssparkutils.fs.cp(src, dst, True)
-    src_n = len(_list_files(src))
-    dst_n = len(_list_files(dst))
-    return {"copied": True, "src": src, "dst": dst, "src_file_count": src_n, "dst_file_count": dst_n, "match": src_n == dst_n}
-
-spark.sql(f"CREATE SCHEMA IF NOT EXISTS {STG_SCHEMA}")
-staging_sync = {"layers": {}, "tables": {}}
-
-for layer in SYNC_LAYERS:
-    staging_sync["layers"][layer] = _copy_tree(f"{DEV_ROOT}/{layer}", f"{STG_ROOT}/{layer}")
-    print("STAGING FILE SYNC", staging_sync["layers"][layer])
-
+staging_tables = {}
 for t in SYNC_TABLES:
     src_t = f"{SCHEMA}.{t}"
     dst_t = f"{STG_SCHEMA}.{t}"
     try:
         if not spark.catalog.tableExists(src_t):
-            staging_sync["tables"][t] = {"copied": False, "reason": "source_missing"}
+            staging_tables[t] = {"copied": False, "reason": "source_missing"}
             continue
         src_cnt = spark.table(src_t).count()
         spark.sql(f"DROP TABLE IF EXISTS {dst_t}")
@@ -636,31 +738,58 @@ for t in SYNC_TABLES:
             pass
         spark.table(src_t).write.format("delta").mode("overwrite").option("overwriteSchema", "true").saveAsTable(dst_t)
         dst_cnt = spark.table(dst_t).count()
-        staging_sync["tables"][t] = {
-            "copied": True,
-            "src": src_t,
-            "dst": dst_t,
-            "src_count": src_cnt,
-            "dst_count": dst_cnt,
-            "match": src_cnt == dst_cnt,
+        staging_tables[t] = {
+            "copied": True, "src": src_t, "dst": dst_t,
+            "src_count": src_cnt, "dst_count": dst_cnt, "match": src_cnt == dst_cnt,
         }
-        print("STAGING TABLE SYNC", t, src_cnt, "->", dst_cnt)
+        print("STAGING_GOLD", t, src_cnt, "->", dst_cnt)
     except Exception as e:
-        staging_sync["tables"][t] = {"copied": False, "error": str(e)}
-        print("STAGING TABLE FAIL", t, e)
+        staging_tables[t] = {"copied": False, "error": str(e)}
+        print("STAGING_GOLD FAIL", t, e)
+
+# Also export Gold Delta snapshots under Development + Staging Files/Gold/tables
+gold_file_sync = []
+for t in SYNC_TABLES:
+    if not spark.catalog.tableExists(f"{SCHEMA}.{t}"):
+        continue
+    df = spark.table(f"{SCHEMA}.{t}")
+    for root in [f"{DEV_ROOT}/Gold/tables", f"{STG_ROOT}/Gold/tables"]:
+        path = f"{root}/{t}"
+        try:
+            mssparkutils.fs.mkdirs(root)
+            df.write.format("delta").mode("overwrite").option("overwriteSchema", True).save(path)
+            gold_file_sync.append({"path": path, "rows": df.count(), "ok": True})
+            print("GOLD FILES", path)
+        except Exception as e:
+            gold_file_sync.append({"path": path, "ok": False, "error": str(e)[:200]})
 
 wm = {
     "updated_at_utc": datetime.now(timezone.utc).isoformat(),
-    "mode": "incremental_merge",
+    "mode": "incremental_merge_dual_bronze",
+    "bronze_roots": {"meta": META_ROOTS, "google": GOOGLE_ROOTS},
     "meta_ptrs": meta_ptrs,
     "google_ptrs": google_ptrs,
     "before": before,
     "after": after,
-    "staging_sync": staging_sync,
-    "note": "Existing Gold rows kept via MERGE; Staging Files + Staging_Gold mirrored from Development after refresh",
+    "silver_sync": silver_sync,
+    "bronze_sync": bronze_sync,
+    "staging_gold": staging_tables,
+    "gold_file_sync": gold_file_sync,
+    "note": "Ingests Development+Staging Bronze; MERGEs Gold; writes Silver to Dev+Staging; mirrors Staging_Gold; bidirectional Bronze fill",
 }
 mssparkutils.fs.put(CONTROL, json.dumps(wm, indent=2), True)
+mssparkutils.fs.mkdirs("Files/Development/Gold/exports")
 mssparkutils.fs.put(SUMMARY, json.dumps(wm, indent=2), True)
-mssparkutils.fs.put(f"{STG_ROOT}/_copy_from_development_summary.json", json.dumps(staging_sync, indent=2), True)
-print("DONE", json.dumps(wm, indent=2))
-mssparkutils.notebook.exit(json.dumps({"status": "success", "after": after, "staging_ok": all(v.get("match") for v in staging_sync["tables"].values() if v.get("copied"))}))
+mssparkutils.fs.mkdirs("Files/Staging/Gold/exports")
+mssparkutils.fs.put(SUMMARY_STG, json.dumps(wm, indent=2), True)
+mssparkutils.fs.put(f"{STG_ROOT}/_copy_from_development_summary.json", json.dumps({
+    "bronze_sync": bronze_sync,
+    "silver_sync": silver_sync,
+    "staging_gold": staging_tables,
+}, indent=2), True)
+print("DONE", json.dumps({k: wm[k] for k in ["updated_at_utc", "before", "after"]}, indent=2))
+mssparkutils.notebook.exit(json.dumps({
+    "status": "success",
+    "after": after,
+    "staging_ok": all(v.get("match") for v in staging_tables.values() if v.get("copied")),
+}))

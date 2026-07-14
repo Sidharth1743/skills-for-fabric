@@ -1,6 +1,6 @@
 # MIP Medallion Refresh Pipeline
 
-Automatically refreshes **Gold `rpt_*` + consumer `vw_*` Delta tables** when new Bronze batch files land.
+Automatically refreshes **Silver files + Gold `rpt_*` / `vw_*` + `Staging_Gold`** when new Bronze batch files land in **Development or Staging**.
 
 ## Fabric items (MarketingIntelligencePlatform)
 
@@ -12,57 +12,65 @@ Automatically refreshes **Gold `rpt_*` + consumer `vw_*` Delta tables** when new
 | Pipeline | `MIP_Medallion_Refresh_Pipeline` | `5e73aa34-45ef-4875-b640-ef4bc0e5c104` |
 | Schedule | Cron every **5 minutes** (UTC, enabled) | `e8d5ac12-6d86-422d-91d9-abe3587cf509` |
 
-## Bronze layout (source of truth)
+## Bronze sources (Development + Staging)
 
-Batch CSVs + nested pointers live under **Development**:
+Batch CSVs + nested pointers are discovered from **both** environments:
 
 ```text
-Files/Development/Bronze/Meta_ads/meta_campaigns/
-├── meta_campaigns_{batchId}.csv
-└── {tenantId}/{accountId}/{connectorId}/
-    └── meta_campaigns_latest_batch.txt
+Files/Development/Bronze/Meta_ads/...
+Files/Staging/Bronze/Meta_ads/...
+Files/Staging/Bronze/Bronze/Meta_ads/...   # legacy nested copy also scanned
 
-Files/Development/Bronze/Google_ads/google_ad_performance/
-├── google_ad_performance_{batchId}.csv
-└── {tenantId}/{accountId}/{connectorId}/
-    └── google_ad_performance_latest_batch.txt
+Files/Development/Bronze/Google_ads/...
+Files/Staging/Bronze/Google_ads/...
+Files/Staging/Bronze/Bronze/Google_ads/...
 ```
 
-Same pattern for Meta: `meta_adsets`, `meta_ads`, `meta_ad_insights`  
-Google: `google_campaigns`, `google_ad_groups`, `google_ads`, `google_ad_performance`
+Per entity:
+
+```text
+{root}/{entity}/
+├── {entity}_{batchId}.csv
+└── {tenantId}/{accountId}/{connectorId}/
+    └── {entity}_latest_batch.txt
+```
+
+Meta entities: `meta_campaigns`, `meta_adsets`, `meta_ads`, `meta_ad_insights`  
+Google entities: `google_campaigns`, `google_ad_groups`, `google_ads`, `google_ad_performance`
 
 ## Behavior (incremental — does not wipe Gold)
 
-1. Discover nested `*_latest_batch.txt` pointers and load **batch UUID CSVs** (prefers batch files over `*_latest.csv`).
-2. Parse connector envelope (`raw_json`) for Meta + Google.
-3. **MERGE upsert** into:
+1. Discover nested `*_latest_batch.txt` pointers across **all Bronze roots** and load **batch UUID CSVs** (union; prefers batch files over `*_latest.csv`).
+2. **NOOP / skip** when the combined pointer set matches the watermark (avoids overlapping 5-min runs).
+3. Parse connector envelope (`raw_json`) for Meta + Google.
+4. **MERGE upsert Silver Delta files** into:
+   - `Files/Development/Silver/meta_ads/silver_meta_ad_insights`
+   - `Files/Staging/Silver/meta_ads/silver_meta_ad_insights`
+   - `Files/Silver/meta_ads/silver_meta_ad_insights`
+   - `Files/Development/Silver/GoogleAds/silver_google_ad_performance`
+   - `Files/Staging/Silver/GoogleAds/silver_google_ad_performance`
+5. **MERGE upsert** into managed Gold tables:
    - `Gold.rpt_meta_ad_performance_daily`
    - `Gold.rpt_google_ad_performance_daily`
    - `Gold.rpt_unified_ad_performance`  
-   Existing unmatched rows are **kept**. Matched grain keys are updated; new keys are inserted.
-4. Rematerialize Delta tables (SQL-endpoint safe):
+   Existing unmatched rows are **kept**.
+6. Rematerialize Delta tables (SQL-endpoint safe):
    - `Gold.vw_campaign_performance`
    - `Gold.vw_adset_performance`
    - `Gold.vw_ad_performance`
-5. Write watermark/summary:
-   - `Files/Silver/_control/medallion_pipeline_watermark.json`
-   - `Files/Development/Gold/exports/pipeline_refresh_summary.txt`
-6. **Mirror Development → Staging** (exact copy; Development unchanged):
-   - `Files/Development/{Bronze,Silver,Gold}` → `Files/Staging/{Bronze,Silver,Gold}`
-   - `Gold.rpt_*` / `Gold.vw_*` → `Staging_Gold.rpt_*` / `Staging_Gold.vw_*`
+   - `Gold.vw_unified_ad_performance`
+7. **Bidirectional Bronze fill** (copy missing files only; never wipe Staging-only landings):
+   - Development ↔ Staging `Bronze/{Meta_ads,Google_ads}`
+8. Mirror managed tables → **`Staging_Gold.*`** (same `rpt_*` / `vw_*` names).
+9. Export Gold Delta snapshots to:
+   - `Files/Development/Gold/tables/{table}`
+   - `Files/Staging/Gold/tables/{table}`
+10. Write watermark/summaries:
+    - `Files/Silver/_control/medallion_pipeline_watermark.json`
+    - `Files/Development/Gold/exports/pipeline_refresh_summary.txt`
+    - `Files/Staging/Gold/exports/pipeline_refresh_summary.txt`
 
 Grain key: `platform + account_id + campaign_id + adset_id + ad_id + full_date`
-
-## Latest verified refresh (2026-07-13)
-
-| Table | Before | After |
-|-------|--------|-------|
-| `rpt_meta_ad_performance_daily` | 109 | 451 |
-| `rpt_google_ad_performance_daily` | 54 | 144 |
-| `rpt_unified_ad_performance` | 163 | 595 |
-| `vw_campaign_performance` | 98 | 357 |
-| `vw_adset_performance` | 112 | 424 |
-| `vw_ad_performance` | 163 | 595 |
 
 ## Manual run
 
@@ -77,6 +85,6 @@ az rest --method post \
 
 ## Notes
 
-- Open **Tables → Gold → `vw_*`** (these are Delta tables, not Lakehouse Views).
-- Each cron run refreshes **Development Gold**, then mirrors into **Staging Files + `Staging_Gold`**.
+- Open **Tables → Gold → `vw_*`** and **Tables → Staging_Gold → `vw_*`** (Delta tables, not Lakehouse Views).
+- Connector may land Bronze under Development, Staging, or both — cron watches all listed roots.
 - Disable schedule via PATCH `enabled: false` if you need to pause.
