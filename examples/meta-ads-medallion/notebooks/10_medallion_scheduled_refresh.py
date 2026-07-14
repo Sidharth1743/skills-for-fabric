@@ -230,26 +230,30 @@ def merge_into_table(df, table_name, keys, schema=SCHEMA):
         return {"table": full, "count": cnt, "created": True}
 
 def merge_into_path(df, path, keys):
-    """MERGE upsert into a Files/ Delta path (Silver layer)."""
+    """MERGE upsert into a Files/ Delta path (Silver layer). Aligns to existing columns when present."""
     if df is None or df.rdd.isEmpty():
         return {"path": path, "skipped": True}
-    df = df.dropDuplicates(keys)
     try:
         is_delta = DeltaTable.isDeltaTable(spark, path)
     except Exception:
         is_delta = False
     if is_delta:
         existing = spark.read.format("delta").load(path)
-        for c in existing.columns:
+        tcols = existing.columns
+        # only merge columns that already exist on target (avoid schema fights)
+        for c in tcols:
             if c not in df.columns:
                 df = df.withColumn(c, F.lit(None))
-        # keep source columns even if new
-        cols = list(dict.fromkeys(list(existing.columns) + [c for c in df.columns if c not in existing.columns]))
-        for c in cols:
-            if c not in df.columns:
-                df = df.withColumn(c, F.lit(None))
-        df = df.select(*cols)
-        cond = " AND ".join([f"t.`{k}` <=> s.`{k}`" for k in keys if k in cols])
+        df = df.select(*tcols)
+        use_keys = [k for k in keys if k in tcols]
+        if not use_keys:
+            # fall back to overwrite when grain keys are incompatible
+            df.write.format("delta").mode("overwrite").option("overwriteSchema", True).save(path)
+            cnt = spark.read.format("delta").load(path).count()
+            print("[SILVER OVERWRITE]", path, "rows=", cnt, "reason=no_compatible_keys")
+            return {"path": path, "count": cnt, "overwritten": True}
+        df = df.dropDuplicates(use_keys)
+        cond = " AND ".join([f"t.`{k}` <=> s.`{k}`" for k in use_keys])
         (
             DeltaTable.forPath(spark, path).alias("t")
             .merge(df.alias("s"), cond)
@@ -258,18 +262,45 @@ def merge_into_path(df, path, keys):
             .execute()
         )
         cnt = spark.read.format("delta").load(path).count()
-        print("[SILVER MERGE]", path, "rows=", cnt)
-        return {"path": path, "count": cnt, "merged": True}
+        print("[SILVER MERGE]", path, "rows=", cnt, "keys=", use_keys)
+        return {"path": path, "count": cnt, "merged": True, "keys": use_keys}
     mssparkutils.fs.mkdirs(path.rsplit("/", 1)[0])
+    df = df.dropDuplicates([k for k in keys if k in df.columns] or df.columns[:1])
     df.write.format("delta").mode("overwrite").option("overwriteSchema", True).save(path)
     cnt = spark.read.format("delta").load(path).count()
     print("[SILVER CREATE]", path, "rows=", cnt)
     return {"path": path, "count": cnt, "created": True}
 
 def write_silver_multi(df, relative_name, keys, roots):
+    """MERGE into Development / Files/Silver; overwrite Staging so both envs match current batch set."""
     results = []
     for root in roots:
-        results.append(merge_into_path(df, f"{root}/{relative_name}", keys))
+        path = f"{root}/{relative_name}"
+        if "/Staging/" in root:
+            if df is None or df.rdd.isEmpty():
+                results.append({"path": path, "skipped": True})
+                continue
+            mssparkutils.fs.mkdirs(path.rsplit("/", 1)[0])
+            # Align to existing Staging schema when present, else write full frame
+            try:
+                is_delta = DeltaTable.isDeltaTable(spark, path)
+            except Exception:
+                is_delta = False
+            out = df
+            if is_delta:
+                tcols = spark.read.format("delta").load(path).columns
+                for c in tcols:
+                    if c not in out.columns:
+                        out = out.withColumn(c, F.lit(None))
+                # keep any new columns too
+                cols = list(dict.fromkeys(list(tcols) + [c for c in out.columns if c not in tcols]))
+                out = out.select(*[c for c in cols if c in out.columns])
+            out.write.format("delta").mode("overwrite").option("overwriteSchema", True).save(path)
+            cnt = spark.read.format("delta").load(path).count()
+            print("[SILVER OVERWRITE STAGING]", path, "rows=", cnt)
+            results.append({"path": path, "count": cnt, "overwritten": True})
+        else:
+            results.append(merge_into_path(df, path, keys))
     return results
 
 def sync_missing_files(src_root, dst_root):
@@ -577,16 +608,24 @@ print("BEFORE", before)
 
 # -------- Silver file writes (Development + Staging + Files/Silver) --------
 silver_sync = {"meta": [], "google": []}
+# Align to existing Silver Delta schemas (adgroup_id/date for Google; date_start for Meta)
+meta_silver_out = meta_silver.withColumn("silver_processed_at", F.current_timestamp())
+google_silver_out = (
+    google_silver
+    .withColumnRenamed("adset_id", "adgroup_id")
+    .withColumnRenamed("full_date", "date")
+    .withColumn("silver_processed_at", F.current_timestamp())
+)
 silver_sync["meta"] = write_silver_multi(
-    meta_silver,
+    meta_silver_out,
     "silver_meta_ad_insights",
     ["tenant_id", "account_id", "campaign_id", "adset_id", "ad_id", "date_start"],
     SILVER_META_ROOTS,
 )
 silver_sync["google"] = write_silver_multi(
-    google_silver,
+    google_silver_out,
     "silver_google_ad_performance",
-    ["tenant_id", "account_id", "campaign_id", "adset_id", "ad_id", "full_date"],
+    ["tenant_id", "account_id", "campaign_id", "adgroup_id", "ad_id", "date"],
     SILVER_GOOGLE_ROOTS,
 )
 
