@@ -71,6 +71,13 @@ No Bronze/Silver GA4 entity is left without a Gold dim or fact.
 
 **`Gold.vw_google_analytics_performance`** (alias `vw_ga4_unified`, backing `rpt_ga4_unified`)
 
+Null handling for consumers:
+- **Metrics** (`sessions`, `total_users`, `active_users`, `conversions`, rates, revenue, etc.) are filled with **0** when not present.
+- **`report_date` / `full_date` / year-month** use daily date when available, else extraction window start (realtime → current date).
+- **`page_title`** is enriched from `dim_ga4_page` when the source report omits it.
+- **`channel_group`** is enriched from `dim_ga4_channel` when missing.
+- Dimension columns that do not apply to an `insight_type` (e.g. `age_bracket` on traffic rows) remain null by design — filter with `insight_type`.
+
 ```sql
 SELECT TOP 100 * FROM Gold.vw_google_analytics_performance;
 SELECT * FROM Gold.vw_google_analytics_performance WHERE insight_type = 'landing_page';

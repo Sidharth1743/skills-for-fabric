@@ -1165,11 +1165,70 @@ if unified_parts:
         u = u.withColumn("measurement_id", F.lit(None).cast("string")) \
              .withColumn("default_uri", F.lit(None).cast("string"))
 
+    # ---- Null cleanup / enrichment for AI + reporting consumers ----
+    # Landing-page grain stores path in landing_page; mirror into page_path for filters.
+    u = u.withColumn("page_path", F.coalesce(F.col("page_path"), F.col("landing_page")))
+    u = u.withColumn("landing_page", F.coalesce(F.col("landing_page"), F.col("page_path")))
+
+    # Fill page_title from dim_ga4_page when source report omitted it
+    if spark.catalog.tableExists(f"{SCHEMA}.dim_ga4_page"):
+        dpage = (
+            spark.table(f"{SCHEMA}.dim_ga4_page")
+            .select("tenant_id", "account_id", "page_path", F.col("page_title").alias("_page_title"))
+            .dropDuplicates(["tenant_id", "account_id", "page_path"])
+        )
+        u = (
+            u.join(dpage, ["tenant_id", "account_id", "page_path"], "left")
+             .withColumn("page_title", F.coalesce(F.col("page_title"), F.col("_page_title")))
+             .drop("_page_title")
+        )
+
+    # Fill channel_group from dim_ga4_channel when missing on traffic/events/hourly
+    if spark.catalog.tableExists(f"{SCHEMA}.dim_ga4_channel"):
+        dch = (
+            spark.table(f"{SCHEMA}.dim_ga4_channel")
+            .select("tenant_id", "account_id", "channel_key", F.col("channel_group").alias("_channel_group"))
+            .dropDuplicates(["tenant_id", "account_id", "channel_key"])
+        )
+        u = (
+            u.join(dch, ["tenant_id", "account_id", "channel_key"], "left")
+             .withColumn("channel_group", F.coalesce(F.col("channel_group"), F.col("_channel_group")))
+             .drop("_channel_group")
+        )
+
+    # report_date: daily grain uses full_date; window-grain uses extraction_start_date;
+    # realtime snapshot falls back to current_date so date parts are never blank.
+    u = u.withColumn(
+        "report_date",
+        F.coalesce(F.col("full_date"), F.col("extraction_start_date"), F.current_date()),
+    )
+    # Keep full_date populated for consumers that only look at that column
+    u = u.withColumn("full_date", F.coalesce(F.col("full_date"), F.col("report_date")))
+
+    # Users: prefer total_users, else active_users (demographics/geo often only have active)
+    u = u.withColumn("total_users", F.coalesce(F.col("total_users"), F.col("active_users")))
+    u = u.withColumn("active_users", F.coalesce(F.col("active_users"), F.col("total_users")))
+
+    # Metric null → 0 (dimension attrs stay null when not applicable to insight_type)
+    metric_long = [
+        "sessions", "total_users", "active_users", "engaged_sessions", "new_users",
+        "screen_page_views", "key_events", "event_count", "transactions",
+    ]
+    metric_dbl = [
+        "engagement_rate", "bounce_rate", "conversions", "purchase_revenue", "total_revenue",
+    ]
+    for c in metric_long:
+        if c in u.columns:
+            u = u.withColumn(c, F.coalesce(F.col(c), F.lit(0)).cast("long"))
+    for c in metric_dbl:
+        if c in u.columns:
+            u = u.withColumn(c, F.coalesce(F.col(c), F.lit(0.0)).cast("double"))
+
     u = (
-        u.withColumn("year", F.year("full_date"))
-         .withColumn("month", F.month("full_date"))
-         .withColumn("month_name", F.date_format("full_date", "MMMM"))
-         .withColumn("day_name", F.date_format("full_date", "EEEE"))
+        u.withColumn("year", F.year("report_date"))
+         .withColumn("month", F.month("report_date"))
+         .withColumn("month_name", F.date_format("report_date", "MMMM"))
+         .withColumn("day_name", F.date_format("report_date", "EEEE"))
          .withColumn("unified_key", F.concat_ws("||",
             F.coalesce(F.col("insight_type"), F.lit("")),
             F.coalesce(F.col("full_date").cast("string"), F.lit("")),
