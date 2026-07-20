@@ -1,0 +1,43 @@
+{
+  "properties": {
+    "activities": [
+      {
+        "name": "ga4_silver",
+        "type": "TridentNotebook",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "0.12:00:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "notebookId": "c65a6f42-eb74-4a87-9701-96390aa144f4",
+          "workspaceId": "718e8176-5d40-4a9c-88ff-50ac97ac49ba"
+        }
+      },
+      {
+        "name": "ga4_notebook",
+        "type": "TridentNotebook",
+        "dependsOn": [
+          {
+            "activity": "ga4_silver",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "policy": {
+          "timeout": "0.12:00:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "notebookId": "30b30bfe-1e90-4b96-a428-6cac5c116793",
+          "workspaceId": "718e8176-5d40-4a9c-88ff-50ac97ac49ba"
+        }
+      }
+    ]
+  }
+}
