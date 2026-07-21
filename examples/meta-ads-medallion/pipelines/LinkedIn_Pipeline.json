@@ -1,0 +1,43 @@
+{
+  "properties": {
+    "activities": [
+      {
+        "name": "linkedin_silver",
+        "type": "TridentNotebook",
+        "dependsOn": [],
+        "policy": {
+          "timeout": "0.12:00:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "notebookId": "6541f886-b489-4354-b193-ec123c99e12f",
+          "workspaceId": "718e8176-5d40-4a9c-88ff-50ac97ac49ba"
+        }
+      },
+      {
+        "name": "linkedin_gold",
+        "type": "TridentNotebook",
+        "dependsOn": [
+          {
+            "activity": "linkedin_silver",
+            "dependencyConditions": ["Succeeded"]
+          }
+        ],
+        "policy": {
+          "timeout": "0.12:00:00",
+          "retry": 1,
+          "retryIntervalInSeconds": 60,
+          "secureOutput": false,
+          "secureInput": false
+        },
+        "typeProperties": {
+          "notebookId": "ce8c6495-d2e8-4a3d-878b-320eb0e5dc6b",
+          "workspaceId": "718e8176-5d40-4a9c-88ff-50ac97ac49ba"
+        }
+      }
+    ]
+  }
+}
